@@ -313,7 +313,6 @@ string secondWord(const string &line)
 
 bool validateProgram(const char *sourcePath)
 {
-    // for each func defined there should be exactly one func_end and no nested funcs allowed -
     ifstream in(sourcePath);
     if (!in.is_open())
     {
@@ -321,80 +320,40 @@ bool validateProgram(const char *sourcePath)
     }
 
     string line;
-    int funcCount = 0;
-    int funcEndCount = 0;
     bool inFunc = false;
 
     while (getline(in, line))
     {
-        // Trim whitespace
-        string trimmed = "";
-        for (int i = 0; i < line.length(); i++)
+        while (!line.empty() && line.back() == '\r')
         {
-            if (line[i] != ' ' && line[i] != '\t' && line[i] != '\r')
-            {
-                trimmed += line[i];
-            }
+            line.pop_back();
         }
 
-        if (trimmed.empty())
-        {
-            continue;
-        }
-
-        if (trimmed == "func")
+        string instruction = firstWord(line);
+        if (instruction == "func")
         {
             if (inFunc)
             {
-                // Nested func not allowed
-                in.close();
                 return false;
             }
-            funcCount++;
+
+            if (secondWord(line).empty())
+            {
+                return false;
+            }
+
             inFunc = true;
         }
-        else if (trimmed == "func_end")
+        else if (instruction == "func_end")
         {
-            funcEndCount++;
+            if (!inFunc || !secondWord(line).empty())
+            {
+                return false;
+            }
+
             inFunc = false;
         }
     }
 
-    in.close();
-
-    // Each func should have exactly one func_end
-    if (funcCount != funcEndCount)
-    {
-        return false;
-    }
-
-    // Must have a main function
-    // Reset and check for main
-    in.open(sourcePath);
-    if (!in.is_open())
-    {
-        return false;
-    }
-
-    bool hasMain = false;
-    while (getline(in, line))
-    {
-        string trimmed = "";
-        for (int i = 0; i < line.length(); i++)
-        {
-            if (line[i] != ' ' && line[i] != '\t' && line[i] != '\r')
-            {
-                trimmed += line[i];
-            }
-        }
-
-        if (trimmed == "func_main")
-        {
-            hasMain = true;
-            break;
-        }
-    }
-
-    in.close();
-    return hasMain;
+    return !in.bad() && !inFunc;
 }
