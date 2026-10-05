@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <fstream>
 #include <cstring>
+#include <cstdio>
 using namespace std;
 
 // ---- Constants ----
@@ -219,6 +220,62 @@ struct PendingPatch
 };
 
 
+
+// STAGE 0: RECEIVE TRACE AND SAVE IT AS source.bin
+bool receiveTrace(istream &client)
+{
+    ofstream source("source.bin", ios::binary | ios::trunc);
+    if (!source.is_open())
+    {
+        return false;
+    }
+
+    char buffer[IO_BUFFER_SIZE];
+    uint64_t totalBytes = 0;
+
+    while (client)
+    {
+        client.read(buffer, sizeof(buffer));
+        streamsize bytesRead = client.gcount();
+
+        if (bytesRead > 0)
+        {
+            uint64_t chunkSize = static_cast<uint64_t>(bytesRead);
+            if (totalBytes + chunkSize > MAX_SOURCE_BYTES)
+            {
+                source.close();
+                std::remove("source.bin");
+                return false;
+            }
+
+            source.write(buffer, bytesRead);
+            if (!source)
+            {
+                source.close();
+                std::remove("source.bin");
+                return false;
+            }
+
+            totalBytes += chunkSize;
+        }
+    }
+
+    if (client.bad() || (client.fail() && !client.eof()))
+    {
+        source.close();
+        std::remove("source.bin");
+        return false;
+    }
+
+    source.close();
+    if (!source)
+    {
+        std::remove("source.bin");
+        return false;
+    }
+
+    return true;
+}
 
 // PASS 0x0: READING source.bin + VALIDITY CHECK
 bool readSourceLine(ifstream &in, string &out)
