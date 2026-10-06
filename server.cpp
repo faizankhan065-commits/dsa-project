@@ -368,6 +368,156 @@ string secondWord(const string &line)
     return result;
 }
 
+// PASS 0x1: WRITE resolve.bin AND PATCH CALL TARGET OFFSETS
+int64_t resolve(const char *sourcePath, const char *resolvePath)
+{
+    if (sourcePath == NULL || resolvePath == NULL)
+    {
+        return -1;
+    }
+
+    ifstream source(sourcePath, ios::binary);
+    if (!source.is_open())
+    {
+        return -1;
+    }
+
+    ofstream resolved(resolvePath, ios::binary | ios::trunc);
+    if (!resolved.is_open())
+    {
+        return -1;
+    }
+
+    FuncEntry functions[MAX_FUNCS];
+    PendingPatch patches[MAX_PATCHES];
+    int32_t functionCount = 0;
+    int32_t patchCount = 0;
+    int64_t mainOffset = -1;
+    int64_t nextOffset = 0;
+    string line;
+
+    while (readSourceLine(source, line))
+    {
+        if (line.length() > UINT32_MAX || nextOffset < 0 ||
+            nextOffset > INT64_MAX - 12 - static_cast<int64_t>(line.length()))
+        {
+            resolved.close();
+            std::remove(resolvePath);
+            return -1;
+        }
+
+        int64_t recordOffset = nextOffset;
+        uint32_t lineSize = static_cast<uint32_t>(line.length());
+        string instruction = firstWord(line);
+        string name = secondWord(line);
+
+        if (instruction == "func")
+        {
+            if (name.empty() || functionCount >= MAX_FUNCS)
+            {
+                resolved.close();
+                std::remove(resolvePath);
+                return -1;
+            }
+
+            for (int32_t i = 0; i < functionCount; i++)
+            {
+                if (functions[i].funcName == name)
+                {
+                    resolved.close();
+                    std::remove(resolvePath);
+                    return -1;
+                }
+            }
+
+            functions[functionCount].funcName = name;
+            functions[functionCount].byteOffsetInResolveBin = recordOffset;
+            if (name == "main")
+            {
+                mainOffset = recordOffset;
+            }
+            functionCount++;
+        }
+        else if (instruction == "call")
+        {
+            if (name.empty() || patchCount >= MAX_PATCHES)
+            {
+                resolved.close();
+                std::remove(resolvePath);
+                return -1;
+            }
+
+            patches[patchCount].byteOffsetOfOffsetField = recordOffset;
+            patches[patchCount].targetFuncName = name;
+            patchCount++;
+        }
+
+        resolved.write(reinterpret_cast<const char *>(&recordOffset), sizeof(recordOffset));
+        resolved.write(reinterpret_cast<const char *>(&lineSize), sizeof(lineSize));
+        resolved.write(line.data(), static_cast<streamsize>(lineSize));
+        if (!resolved)
+        {
+            resolved.close();
+            std::remove(resolvePath);
+            return -1;
+        }
+
+        nextOffset += 12 + static_cast<int64_t>(lineSize);
+    }
+
+    if (source.bad())
+    {
+        resolved.close();
+        std::remove(resolvePath);
+        return -1;
+    }
+
+    if (mainOffset < 0)
+    {
+        resolved.close();
+        std::remove(resolvePath);
+        return -1;
+    }
+
+    for (int32_t i = 0; i < patchCount; i++)
+    {
+        int64_t targetOffset = -1;
+        for (int32_t j = 0; j < functionCount; j++)
+        {
+            if (functions[j].funcName == patches[i].targetFuncName)
+            {
+                targetOffset = functions[j].byteOffsetInResolveBin;
+                break;
+            }
+        }
+
+        if (targetOffset < 0)
+        {
+            resolved.close();
+            std::remove(resolvePath);
+            return -1;
+        }
+
+        resolved.seekp(patches[i].byteOffsetOfOffsetField, ios::beg);
+        resolved.write(reinterpret_cast<const char *>(&targetOffset), sizeof(targetOffset));
+        if (!resolved)
+        {
+            resolved.close();
+            std::remove(resolvePath);
+            return -1;
+        }
+    }
+
+    resolved.close();
+    if (!resolved)
+    {
+        std::remove(resolvePath);
+        return -1;
+    }
+
+    return mainOffset;
+}
+
 bool validateProgram(const char *sourcePath)
 {
     ifstream in(sourcePath);

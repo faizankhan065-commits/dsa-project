@@ -1,7 +1,8 @@
 # Time-Travel Debugger
 
-This is a small C++ project for working with program traces.
+I have started building the server for the Time-Travel Debugger in C++.
 
-The server code checks that function definitions are properly closed and
-receives trace data through an input stream. It saves the data to `source.bin`
-in small blocks and rejects files larger than 15 MB.
+So far, the code checks function boundaries, saves received trace data to
+`source.bin`, and creates `resolve.bin` with an offset and line size for each
+instruction. It also looks up function names and patches call records with
+their function offsets. The source file limit is 15 MB.
