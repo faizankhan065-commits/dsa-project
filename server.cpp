@@ -280,35 +280,50 @@ bool receiveTrace(istream &client)
 // PASS 0x0: READING source.bin + VALIDITY CHECK
 bool readSourceLine(ifstream &in, string &out)
 {
-    // reads the next nonblank line
-    char c;
-    out = "";
-
-    // Skip whitespace and newlines
-    while (in.get(c))
+    while (getline(in, out))
     {
-        if (c != ' ' && c != '\t' && c != '\n' && c != '\r')
+        if (!out.empty() && out.back() == '\r')
         {
-            break;
+            out.pop_back();
         }
+
+        bool hasText = false;
+        for (size_t i = 0; i < out.length(); i++)
+        {
+            if (out[i] != ' ' && out[i] != '\t')
+            {
+                hasText = true;
+                break;
+            }
+        }
+
+        if (!hasText)
+        {
+            continue;
+        }
+
+        while (!out.empty() && (out.back() == ' ' || out.back() == '\t'))
+        {
+            out.pop_back();
+        }
+        return true;
     }
 
-    if (!in.good())
+    return false;
+}
+
+bool writeResolveRecord(ofstream &out, int64_t offset, const string &line)
+{
+    if (offset < 0 || line.length() > UINT32_MAX)
     {
         return false;
     }
 
-    // Put the character back and read the line
-    in.putback(c);
-    getline(in, out);
-
-    // Trim trailing whitespace
-    while (!out.empty() && (out.back() == ' ' || out.back() == '\t' || out.back() == '\n' || out.back() == '\r'))
-    {
-        out.pop_back();
-    }
-
-    return !out.empty();
+    uint32_t lineSize = static_cast<uint32_t>(line.length());
+    out.write(reinterpret_cast<const char *>(&offset), sizeof(offset));
+    out.write(reinterpret_cast<const char *>(&lineSize), sizeof(lineSize));
+    out.write(line.data(), static_cast<streamsize>(lineSize));
+    return static_cast<bool>(out);
 }
 string firstWord(const string &line)
 {
@@ -407,7 +422,6 @@ int64_t resolve(const char *sourcePath, const char *resolvePath)
         }
 
         int64_t recordOffset = nextOffset;
-        uint32_t lineSize = static_cast<uint32_t>(line.length());
         string instruction = firstWord(line);
         string name = secondWord(line);
 
@@ -452,10 +466,7 @@ int64_t resolve(const char *sourcePath, const char *resolvePath)
             patchCount++;
         }
 
-        resolved.write(reinterpret_cast<const char *>(&recordOffset), sizeof(recordOffset));
-        resolved.write(reinterpret_cast<const char *>(&lineSize), sizeof(lineSize));
-        resolved.write(line.data(), static_cast<streamsize>(lineSize));
-        if (!resolved)
+        if (!writeResolveRecord(resolved, recordOffset, line))
         {
             resolved.close();
             std::remove(resolvePath);
