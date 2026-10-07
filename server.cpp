@@ -383,6 +383,41 @@ string secondWord(const string &line)
     return result;
 }
 
+int64_t findFunctionOffset(FuncEntry functions[], int32_t functionCount, const string &name)
+{
+    for (int32_t i = 0; i < functionCount; i++)
+    {
+        if (functions[i].funcName == name)
+        {
+            return functions[i].byteOffsetInResolveBin;
+        }
+    }
+
+    return -1;
+}
+
+bool patchCallTargets(ofstream &resolved, FuncEntry functions[], int32_t functionCount,
+                      PendingPatch patches[], int32_t patchCount)
+{
+    for (int32_t i = 0; i < patchCount; i++)
+    {
+        int64_t targetOffset = findFunctionOffset(functions, functionCount, patches[i].targetFuncName);
+        if (targetOffset < 0)
+        {
+            return false;
+        }
+
+        resolved.seekp(patches[i].byteOffsetOfOffsetField, ios::beg);
+        resolved.write(reinterpret_cast<const char *>(&targetOffset), sizeof(targetOffset));
+        if (!resolved)
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 // PASS 0x1: WRITE resolve.bin AND PATCH CALL TARGET OFFSETS
 int64_t resolve(const char *sourcePath, const char *resolvePath)
 {
@@ -422,6 +457,7 @@ int64_t resolve(const char *sourcePath, const char *resolvePath)
         }
 
         int64_t recordOffset = nextOffset;
+        uint32_t lineSize = static_cast<uint32_t>(line.length());
         string instruction = firstWord(line);
         string name = secondWord(line);
 
@@ -490,33 +526,11 @@ int64_t resolve(const char *sourcePath, const char *resolvePath)
         return -1;
     }
 
-    for (int32_t i = 0; i < patchCount; i++)
+    if (!patchCallTargets(resolved, functions, functionCount, patches, patchCount))
     {
-        int64_t targetOffset = -1;
-        for (int32_t j = 0; j < functionCount; j++)
-        {
-            if (functions[j].funcName == patches[i].targetFuncName)
-            {
-                targetOffset = functions[j].byteOffsetInResolveBin;
-                break;
-            }
-        }
-
-        if (targetOffset < 0)
-        {
-            resolved.close();
-            std::remove(resolvePath);
-            return -1;
-        }
-
-        resolved.seekp(patches[i].byteOffsetOfOffsetField, ios::beg);
-        resolved.write(reinterpret_cast<const char *>(&targetOffset), sizeof(targetOffset));
-        if (!resolved)
-        {
-            resolved.close();
-            std::remove(resolvePath);
-            return -1;
-        }
+        resolved.close();
+        std::remove(resolvePath);
+        return -1;
     }
 
     resolved.close();
@@ -528,6 +542,19 @@ int64_t resolve(const char *sourcePath, const char *resolvePath)
 
     return mainOffset;
 }
+
+enum TokenType
+{
+    KEYWORD,
+    IDENTIFIER,
+    PARAM
+};
+
+struct Token
+{
+    TokenType type;
+    string text;
+};
 
 bool validateProgram(const char *sourcePath)
 {
