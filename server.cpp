@@ -14,6 +14,7 @@
 #include <fstream>
 #include <cstring>
 #include <cstdio>
+#include <limits>
 using namespace std;
 
 // ---- Constants ----
@@ -555,6 +556,235 @@ struct Token
     TokenType type;
     string text;
 };
+
+bool tokenizeLine(const string &line, Token tokens[], int32_t maxTokens, int32_t &tokenCount)
+{
+    tokenCount = 0;
+    if (maxTokens <= 0)
+    {
+        return false;
+    }
+
+    size_t position = 0;
+    while (position < line.length())
+    {
+        while (position < line.length() && (line[position] == ' ' || line[position] == '\t'))
+        {
+            position++;
+        }
+
+        if (position == line.length())
+        {
+            break;
+        }
+
+        if (tokenCount >= maxTokens)
+        {
+            tokenCount = 0;
+            return false;
+        }
+
+        string text = "";
+        while (position < line.length() && line[position] != ' ' && line[position] != '\t')
+        {
+            text += line[position];
+            position++;
+        }
+
+        tokens[tokenCount].text = text;
+        if (tokenCount == 0)
+        {
+            tokens[tokenCount].type = KEYWORD;
+        }
+        else if (tokenCount == 1)
+        {
+            tokens[tokenCount].type = IDENTIFIER;
+        }
+        else
+        {
+            tokens[tokenCount].type = PARAM;
+        }
+        tokenCount++;
+    }
+
+    return tokenCount > 0;
+}
+
+int32_t findFrameVariable(const Frame &frame, const string &name)
+{
+    for (int32_t i = 0; i < frame.localCount; i++)
+    {
+        if (frame.locals[i].name == name)
+        {
+            return i;
+        }
+    }
+
+    for (int32_t i = 0; i < frame.argc; i++)
+    {
+        if (frame.argv[i].name == name)
+        {
+            return -i - 2;
+        }
+    }
+
+    return -1;
+}
+
+bool readFrameValue(const Frame &frame, const string &text, int32_t &value)
+{
+    int32_t variableIndex = findFrameVariable(frame, text);
+    if (variableIndex >= 0)
+    {
+        value = frame.locals[variableIndex].value;
+        return true;
+    }
+    if (variableIndex <= -2)
+    {
+        value = frame.argv[-variableIndex - 2].value;
+        return true;
+    }
+
+    size_t position = 0;
+    bool negative = false;
+    if (!text.empty() && (text[0] == '-' || text[0] == '+'))
+    {
+        negative = text[0] == '-';
+        position++;
+    }
+    if (position == text.length())
+    {
+        return false;
+    }
+
+    uint64_t limit = negative
+        ? static_cast<uint64_t>(numeric_limits<int32_t>::max()) + 1
+        : static_cast<uint64_t>(numeric_limits<int32_t>::max());
+    uint64_t number = 0;
+    for (; position < text.length(); position++)
+    {
+        char digit = text[position];
+        if (digit < '0' || digit > '9')
+        {
+            return false;
+        }
+        uint64_t digitValue = static_cast<uint64_t>(digit - '0');
+        if (number > (limit - digitValue) / 10)
+        {
+            return false;
+        }
+        number = number * 10 + digitValue;
+    }
+
+    if (negative)
+    {
+        if (number == limit)
+        {
+            value = numeric_limits<int32_t>::min();
+        }
+        else
+        {
+            value = -static_cast<int32_t>(number);
+        }
+    }
+    else
+    {
+        value = static_cast<int32_t>(number);
+    }
+    return true;
+}
+
+bool writeFrameValue(Frame &frame, const string &name, int32_t value, bool createLocal)
+{
+    int32_t variableIndex = findFrameVariable(frame, name);
+    if (variableIndex >= 0)
+    {
+        frame.locals[variableIndex].value = value;
+        return true;
+    }
+    if (variableIndex <= -2)
+    {
+        frame.argv[-variableIndex - 2].value = value;
+        return true;
+    }
+    if (!createLocal || frame.localCount >= MAX_VARS_PER_FRAME)
+    {
+        return false;
+    }
+
+    frame.locals[frame.localCount].name = name;
+    frame.locals[frame.localCount].value = value;
+    frame.localCount++;
+    return true;
+}
+
+bool executeArithmetic(const Token tokens[], int32_t tokenCount, Frame &frame)
+{
+    if (tokenCount != 3 || tokens[0].type != KEYWORD ||
+        tokens[1].type != IDENTIFIER || tokens[2].type != PARAM ||
+        frame.argc < 0 || frame.argc > MAX_VARS_PER_FRAME ||
+        frame.localCount < 0 || frame.localCount > MAX_VARS_PER_FRAME)
+    {
+        return false;
+    }
+
+    const string &operation = tokens[0].text;
+    if (operation != "set" && operation != "add" && operation != "sub" &&
+        operation != "mul" && operation != "div")
+    {
+        return false;
+    }
+
+    int32_t rightValue = 0;
+    if (!readFrameValue(frame, tokens[2].text, rightValue))
+    {
+        return false;
+    }
+
+    if (operation == "set")
+    {
+        return writeFrameValue(frame, tokens[1].text, rightValue, true);
+    }
+
+    int32_t targetIndex = findFrameVariable(frame, tokens[1].text);
+    if (targetIndex == -1)
+    {
+        return false;
+    }
+    int32_t leftValue = targetIndex >= 0
+        ? frame.locals[targetIndex].value
+        : frame.argv[-targetIndex - 2].value;
+    int64_t result = leftValue;
+
+    if (operation == "add")
+    {
+        result += rightValue;
+    }
+    else if (operation == "sub")
+    {
+        result -= rightValue;
+    }
+    else if (operation == "mul")
+    {
+        result *= rightValue;
+    }
+    else
+    {
+        if (rightValue == 0 ||
+            (leftValue == numeric_limits<int32_t>::min() && rightValue == -1))
+        {
+            return false;
+        }
+        result = leftValue / rightValue;
+    }
+
+    if (result < numeric_limits<int32_t>::min() || result > numeric_limits<int32_t>::max())
+    {
+        return false;
+    }
+
+    return writeFrameValue(frame, tokens[1].text, static_cast<int32_t>(result), false);
+}
 
 bool validateProgram(const char *sourcePath)
 {
