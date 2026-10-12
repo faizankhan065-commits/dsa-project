@@ -27,6 +27,22 @@ numbers or existing variables, updates the current frame's variables, and
 rejects invalid numbers, missing variables, division by zero, and results
 outside the `int32` range.
 
-These token and arithmetic helpers are in place for the execution stage. They
-are not yet connected to a complete run of the trace; call-stack execution,
-snapshots, and the `.tdbg` output still need to be added.
+## Running instructions and saving history
+
+The `executeProgram` helper starts at the offset of `main` in `resolve.bin`.
+When it reaches a `call`, it finds the function header, checks that the
+arguments match the function parameters, and adds a new frame to the call
+stack. It passes argument values into that frame and, when a function changes
+one of its arguments, copies the updated value back to the caller's variable.
+When it reaches `func_end`, it returns to the saved position in the calling
+function.
+
+After each instruction, the code copies the current call stack into a
+snapshot, including the function names, arguments, local variables, and return
+positions in the stack. `Timeline` keeps those snapshots in order in a doubly
+linked list, so later code can use them to write the execution history to the
+`.tdbg` file.
+
+The receive, resolve, and execution helpers are implemented separately so
+far; the server entry point and `.tdbg` file writing still need to connect
+them into the full client-server flow.

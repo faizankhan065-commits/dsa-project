@@ -47,6 +47,15 @@ public:
         top = NULL;
         count = 0;
     }
+    ~Stack()
+    {
+        while (top != NULL)
+        {
+            Node *temp = top;
+            top = top->next;
+            delete temp;
+        }
+    }
     void push(const T &val)
     {
         // pushes the value on the stack if max limit is not reached yet.
@@ -150,9 +159,14 @@ public:
         tail = NULL;
         stepCount = 0;
     }
-    void record(Snapshot *s)
+    ~Timeline();
+    bool record(Snapshot *s)
     {
-        // add record in the timeline
+        if (s == NULL || stepCount == numeric_limits<int32_t>::max())
+        {
+            return false;
+        }
+
         TimelineNode *newNode = new TimelineNode();
         newNode->data = s;
         newNode->next = NULL;
@@ -169,6 +183,7 @@ public:
             head = newNode;
         }
         stepCount++;
+        return true;
     }
     TimelineNode *begin()
     {
@@ -191,6 +206,8 @@ struct Frame
     string func_name;
     int32_t argc;
     Variable argv[MAX_VARS_PER_FRAME];
+    string callerArgNames[MAX_VARS_PER_FRAME];
+    bool callerArgIsVariable[MAX_VARS_PER_FRAME];
     int32_t returnLine;
     Variable locals[MAX_VARS_PER_FRAME];
     int32_t localCount;
@@ -200,6 +217,17 @@ struct Snapshot
     Frame callStack[MAX_STACK_DEPTH];
     int32_t stackDepth;
 };
+Timeline::~Timeline()
+{
+    TimelineNode *current = head;
+    while (current != NULL)
+    {
+        TimelineNode *next = current->next;
+        delete current->data;
+        delete current;
+        current = next;
+    }
+}
 struct TTDBHeader
 {
     char magic[4]; // "TTDB"
@@ -784,6 +812,257 @@ bool executeArithmetic(const Token tokens[], int32_t tokenCount, Frame &frame)
     }
 
     return writeFrameValue(frame, tokens[1].text, static_cast<int32_t>(result), false);
+}
+
+bool readResolveRecord(ifstream &resolved, int64_t offset, int64_t &recordOffset,
+                       string &line, int64_t &nextOffset)
+{
+    if (offset < 0)
+    {
+        return false;
+    }
+
+    resolved.clear();
+    resolved.seekg(0, ios::end);
+    streampos fileEndPosition = resolved.tellg();
+    if (fileEndPosition == streampos(-1))
+    {
+        return false;
+    }
+    streamoff fileEnd = static_cast<streamoff>(fileEndPosition);
+    if (static_cast<streamoff>(offset) > fileEnd - 12)
+    {
+        return false;
+    }
+
+    resolved.seekg(offset, ios::beg);
+    if (!resolved)
+    {
+        return false;
+    }
+
+    uint32_t lineSize = 0;
+    resolved.read(reinterpret_cast<char *>(&recordOffset), sizeof(recordOffset));
+    resolved.read(reinterpret_cast<char *>(&lineSize), sizeof(lineSize));
+    if (!resolved || recordOffset < 0 ||
+        static_cast<streamoff>(lineSize) > fileEnd - static_cast<streamoff>(offset) - 12)
+    {
+        return false;
+    }
+
+    line.assign(lineSize, '\0');
+    if (lineSize > 0)
+    {
+        resolved.read(&line[0], static_cast<streamsize>(lineSize));
+        if (!resolved)
+        {
+            return false;
+        }
+    }
+
+    nextOffset = offset + 12 + static_cast<int64_t>(lineSize);
+    return true;
+}
+
+bool recordSnapshot(Stack<Frame> &callStack, Timeline &timeline)
+{
+    Snapshot *snapshot = new Snapshot();
+    snapshot->stackDepth = callStack.snapshot_into(snapshot->callStack, MAX_STACK_DEPTH);
+    if (snapshot->stackDepth != callStack.depth())
+    {
+        delete snapshot;
+        return false;
+    }
+    if (!timeline.record(snapshot))
+    {
+        delete snapshot;
+        return false;
+    }
+    return true;
+}
+
+bool executeProgram(const char *resolvePath, int64_t mainOffset, Timeline &timeline)
+{
+    if (resolvePath == NULL || mainOffset < 0)
+    {
+        return false;
+    }
+
+    ifstream resolved(resolvePath, ios::binary);
+    if (!resolved.is_open())
+    {
+        return false;
+    }
+
+    Stack<Frame> callStack;
+    Frame mainFrame = {};
+    mainFrame.func_name = "main";
+    mainFrame.returnLine = -1;
+    callStack.push(mainFrame);
+    if (callStack.depth() != 1)
+    {
+        return false;
+    }
+
+    int64_t programCounter = mainOffset;
+    bool finished = false;
+    while (!finished)
+    {
+        int64_t recordOffset = -1;
+        int64_t nextOffset = -1;
+        string line;
+        if (!readResolveRecord(resolved, programCounter, recordOffset, line, nextOffset))
+        {
+            return false;
+        }
+
+        Token tokens[MAX_TOKENS];
+        int32_t tokenCount = 0;
+        if (!tokenizeLine(line, tokens, MAX_TOKENS, tokenCount))
+        {
+            return false;
+        }
+
+        const string &instruction = tokens[0].text;
+        if (instruction != "call" && recordOffset != programCounter)
+        {
+            return false;
+        }
+
+        if (instruction == "func")
+        {
+            if (tokenCount < 2 || callStack.isEmpty())
+            {
+                return false;
+            }
+
+            Frame &frame = callStack.peek();
+            if (tokens[1].text != frame.func_name || tokenCount - 2 != frame.argc)
+            {
+                return false;
+            }
+            for (int32_t i = 0; i < frame.argc; i++)
+            {
+                if (tokens[i + 2].text != frame.argv[i].name)
+                {
+                    return false;
+                }
+            }
+            programCounter = nextOffset;
+        }
+        else if (instruction == "call")
+        {
+            if (tokenCount < 2 || callStack.isEmpty())
+            {
+                return false;
+            }
+
+            int64_t functionOffset = recordOffset;
+            int64_t ignoredNextOffset = -1;
+            int64_t functionRecordOffset = -1;
+            string functionLine;
+            if (!readResolveRecord(resolved, functionOffset, functionRecordOffset,
+                                   functionLine, ignoredNextOffset))
+            {
+                return false;
+            }
+            if (functionRecordOffset != functionOffset)
+            {
+                return false;
+            }
+
+            Token functionTokens[MAX_TOKENS];
+            int32_t functionTokenCount = 0;
+            if (!tokenizeLine(functionLine, functionTokens, MAX_TOKENS, functionTokenCount) ||
+                functionTokens[0].text != "func" || functionTokenCount < 2 ||
+                functionTokens[1].text != tokens[1].text ||
+                functionTokenCount - 2 != tokenCount - 2 ||
+                nextOffset > numeric_limits<int32_t>::max())
+            {
+                return false;
+            }
+
+            Frame newFrame = {};
+            newFrame.func_name = functionTokens[1].text;
+            newFrame.argc = functionTokenCount - 2;
+            newFrame.returnLine = static_cast<int32_t>(nextOffset);
+
+            Frame &caller = callStack.peek();
+            for (int32_t i = 0; i < newFrame.argc; i++)
+            {
+                newFrame.argv[i].name = functionTokens[i + 2].text;
+                newFrame.callerArgNames[i] = tokens[i + 2].text;
+                newFrame.callerArgIsVariable[i] =
+                    findFrameVariable(caller, tokens[i + 2].text) != -1;
+                for (int32_t j = 0; j < i; j++)
+                {
+                    if (newFrame.argv[j].name == newFrame.argv[i].name)
+                    {
+                        return false;
+                    }
+                }
+                if (!readFrameValue(caller, tokens[i + 2].text, newFrame.argv[i].value))
+                {
+                    return false;
+                }
+            }
+
+            int32_t previousDepth = callStack.depth();
+            callStack.push(newFrame);
+            if (callStack.depth() != previousDepth + 1)
+            {
+                return false;
+            }
+            programCounter = functionOffset;
+        }
+        else if (instruction == "func_end")
+        {
+            if (tokenCount != 1 || callStack.isEmpty())
+            {
+                return false;
+            }
+
+            Frame finishedFrame = callStack.pop();
+            if (callStack.isEmpty())
+            {
+                finished = true;
+            }
+            else
+            {
+                if (finishedFrame.returnLine < 0)
+                {
+                    return false;
+                }
+                Frame &caller = callStack.peek();
+                for (int32_t i = 0; i < finishedFrame.argc; i++)
+                {
+                    if (finishedFrame.callerArgIsVariable[i] &&
+                        !writeFrameValue(caller, finishedFrame.callerArgNames[i],
+                                         finishedFrame.argv[i].value, false))
+                    {
+                        return false;
+                    }
+                }
+                programCounter = finishedFrame.returnLine;
+            }
+        }
+        else
+        {
+            if (callStack.isEmpty() ||
+                !executeArithmetic(tokens, tokenCount, callStack.peek()))
+            {
+                return false;
+            }
+            programCounter = nextOffset;
+        }
+
+        if (!recordSnapshot(callStack, timeline))
+        {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 bool validateProgram(const char *sourcePath)
