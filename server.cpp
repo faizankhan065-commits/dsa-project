@@ -15,6 +15,7 @@
 #include <cstring>
 #include <cstdio>
 #include <limits>
+#include <new>
 using namespace std;
 
 // ---- Constants ----
@@ -360,10 +361,10 @@ string firstWord(const string &line)
     string result = "";
     bool inWord = false;
 
-    for (int i = 0; i < line.length(); i++)
+    for (size_t i = 0; i < line.length(); i++)
     {
         char c = line[i];
-        if (c != ' ' && c != '\t')
+        if (c != ' ' && c != '\t' && c != '\r')
         {
             result += c;
             inWord = true;
@@ -383,24 +384,19 @@ string secondWord(const string &line)
     int wordCount = 0;
     bool inWord = false;
 
-    for (int i = 0; i < line.length(); i++)
+    for (size_t i = 0; i < line.length(); i++)
     {
         char c = line[i];
-        if (c != ' ' && c != '\t')
+        if (c != ' ' && c != '\t' && c != '\r')
         {
-            if (inWord)
-            {
-                result += c;
-            }
-            else
+            if (!inWord)
             {
                 inWord = true;
                 wordCount++;
-                if (wordCount == 2)
-                {
-                    result = "";
-                    result += c;
-                }
+            }
+            if (wordCount == 2)
+            {
+                result += c;
             }
         }
         else
@@ -1065,6 +1061,191 @@ bool executeProgram(const char *resolvePath, int64_t mainOffset, Timeline &timel
     return true;
 }
 
+bool writeUInt32(ofstream &out, uint32_t value)
+{
+    unsigned char bytes[4];
+    for (int32_t i = 0; i < 4; i++)
+    {
+        bytes[i] = static_cast<unsigned char>((value >> (i * 8)) & 0xFF);
+    }
+    out.write(reinterpret_cast<const char *>(bytes), sizeof(bytes));
+    return static_cast<bool>(out);
+}
+
+bool writeInt32(ofstream &out, int32_t value)
+{
+    return writeUInt32(out, static_cast<uint32_t>(value));
+}
+
+bool writeInt64(ofstream &out, int64_t value)
+{
+    uint64_t bits = static_cast<uint64_t>(value);
+    unsigned char bytes[8];
+    for (int32_t i = 0; i < 8; i++)
+    {
+        bytes[i] = static_cast<unsigned char>((bits >> (i * 8)) & 0xFF);
+    }
+    out.write(reinterpret_cast<const char *>(bytes), sizeof(bytes));
+    return static_cast<bool>(out);
+}
+
+bool writeSerializedString(ofstream &out, const string &value)
+{
+    if (value.length() > UINT32_MAX)
+    {
+        return false;
+    }
+    return writeUInt32(out, static_cast<uint32_t>(value.length())) &&
+           (value.empty() ||
+            (out.write(value.data(), static_cast<streamsize>(value.length())), static_cast<bool>(out)));
+}
+
+bool writeSnapshot(ofstream &out, const Snapshot &snapshot)
+{
+    if (snapshot.stackDepth < 0 || snapshot.stackDepth > MAX_STACK_DEPTH ||
+        !writeInt32(out, snapshot.stackDepth))
+    {
+        return false;
+    }
+
+    for (int32_t i = 0; i < snapshot.stackDepth; i++)
+    {
+        const Frame &frame = snapshot.callStack[i];
+        if (frame.argc < 0 || frame.argc > MAX_VARS_PER_FRAME ||
+            frame.localCount < 0 || frame.localCount > MAX_VARS_PER_FRAME ||
+            !writeSerializedString(out, frame.func_name) || !writeInt32(out, frame.argc))
+        {
+            return false;
+        }
+
+        for (int32_t j = 0; j < frame.argc; j++)
+        {
+            if (!writeSerializedString(out, frame.argv[j].name) ||
+                !writeInt32(out, frame.argv[j].value))
+            {
+                return false;
+            }
+        }
+
+        if (!writeInt32(out, frame.returnLine) || !writeInt32(out, frame.localCount))
+        {
+            return false;
+        }
+        for (int32_t j = 0; j < frame.localCount; j++)
+        {
+            if (!writeSerializedString(out, frame.locals[j].name) ||
+                !writeInt32(out, frame.locals[j].value))
+            {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+bool writeTdbg(Timeline &timeline, const char *tdbgPath)
+{
+    if (tdbgPath == NULL || timeline.getStepCount() < 0)
+    {
+        return false;
+    }
+
+    int32_t stepCount = timeline.getStepCount();
+    uint64_t *index = stepCount > 0 ? new (nothrow) uint64_t[stepCount] : NULL;
+    if (stepCount > 0 && index == NULL)
+    {
+        return false;
+    }
+
+    ofstream out(tdbgPath, ios::binary | ios::trunc);
+    if (!out.is_open())
+    {
+        delete[] index;
+        return false;
+    }
+
+    const auto failWrite = [&out, &index, tdbgPath]() -> bool
+    {
+        out.close();
+        std::remove(tdbgPath);
+        delete[] index;
+        return false;
+    };
+
+    const char magic[4] = {'T', 'T', 'D', 'B'};
+    out.write(magic, sizeof(magic));
+    if (!out || !writeInt32(out, 1) || !writeInt32(out, stepCount) || !writeInt64(out, 0))
+    {
+        return failWrite();
+    }
+
+    int32_t writtenSnapshots = 0;
+    for (TimelineNode *node = timeline.begin(); node != NULL; node = node->next)
+    {
+        if (writtenSnapshots >= stepCount)
+        {
+            return failWrite();
+        }
+
+        streampos position = out.tellp();
+        if (position == streampos(-1))
+        {
+            return failWrite();
+        }
+        streamoff offset = static_cast<streamoff>(position);
+        if (offset < 0)
+        {
+            return failWrite();
+        }
+
+        index[writtenSnapshots] = static_cast<uint64_t>(offset);
+        if (!writeSnapshot(out, *node->data))
+        {
+            return failWrite();
+        }
+        writtenSnapshots++;
+    }
+
+    if (writtenSnapshots != stepCount)
+    {
+        return failWrite();
+    }
+
+    streampos indexPosition = out.tellp();
+    if (indexPosition == streampos(-1) || static_cast<streamoff>(indexPosition) < 0)
+    {
+        return failWrite();
+    }
+    uint64_t indexOffset = static_cast<uint64_t>(static_cast<streamoff>(indexPosition));
+    for (int32_t i = 0; i < stepCount; i++)
+    {
+        if (!writeInt64(out, static_cast<int64_t>(index[i])))
+        {
+            return failWrite();
+        }
+    }
+
+    out.seekp(0, ios::beg);
+    if (!out || !out.write(magic, sizeof(magic)) ||
+        !writeInt32(out, 1) || !writeInt32(out, stepCount) ||
+        !writeInt64(out, static_cast<int64_t>(indexOffset)))
+    {
+        return failWrite();
+    }
+
+    out.close();
+    if (!out)
+    {
+        std::remove(tdbgPath);
+        delete[] index;
+        return false;
+    }
+
+    delete[] index;
+    return true;
+}
+
 bool validateProgram(const char *sourcePath)
 {
     ifstream in(sourcePath);
@@ -1110,4 +1291,61 @@ bool validateProgram(const char *sourcePath)
     }
 
     return !in.bad() && !inFunc;
+}
+
+int main(int argc, char *argv[])
+{
+    if (argc > 3)
+    {
+        cerr << "Usage: " << argv[0] << " [trace-file|-] [output.tdbg]" << endl;
+        return 2;
+    }
+
+    ifstream traceFile;
+    istream *trace = &cin;
+    if (argc >= 2 && string(argv[1]) != "-")
+    {
+        traceFile.open(argv[1], ios::binary);
+        if (!traceFile.is_open())
+        {
+            cerr << "Could not open trace input." << endl;
+            return 1;
+        }
+        trace = &traceFile;
+    }
+
+    const char *outputPath = argc == 3 ? argv[2] : "session.tdbg";
+    if (!receiveTrace(*trace))
+    {
+        cerr << "Could not receive trace or trace exceeds 15 MB." << endl;
+        return 1;
+    }
+    if (!validateProgram("source.bin"))
+    {
+        cerr << "Trace validation failed." << endl;
+        return 1;
+    }
+
+    int64_t mainOffset = resolve("source.bin", "resolve.bin");
+    if (mainOffset < 0)
+    {
+        cerr << "Could not resolve the trace. Check main and function calls." << endl;
+        return 1;
+    }
+
+    Timeline timeline;
+    if (!executeProgram("resolve.bin", mainOffset, timeline))
+    {
+        cerr << "Trace execution failed." << endl;
+        return 1;
+    }
+    if (!writeTdbg(timeline, outputPath))
+    {
+        cerr << "Could not write the .tdbg output." << endl;
+        return 1;
+    }
+
+    cout << "Created " << outputPath << " with "
+         << timeline.getStepCount() << " snapshots." << endl;
+    return 0;
 }

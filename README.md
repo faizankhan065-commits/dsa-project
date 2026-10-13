@@ -43,6 +43,33 @@ positions in the stack. `Timeline` keeps those snapshots in order in a doubly
 linked list, so later code can use them to write the execution history to the
 `.tdbg` file.
 
-The receive, resolve, and execution helpers are implemented separately so
-far; the server entry point and `.tdbg` file writing still need to connect
-them into the full client-server flow.
+## Saving the debugger file
+
+The `writeTdbg` function writes the `TTDB` header, all snapshots, and an index
+at the end of the file. The header records the format version, snapshot count,
+and where the index starts. Each index entry points to its snapshot, so a
+reader can jump straight to a selected step.
+
+Snapshots are written field by field rather than copying C++ `string` objects
+from memory. Each string is stored with its length, followed by its text;
+integer fields use a fixed little-endian format. Each frame stores its
+function name, arguments, return position, and local variables.
+
+## Build and run on Windows
+
+With a C++ compiler installed, build the server from PowerShell:
+
+```powershell
+g++ -std=c++11 server.cpp -o server.exe
+```
+
+Give it a trace file and, optionally, an output file:
+
+```powershell
+.\server.exe .\trace.txt .\session.tdbg
+```
+
+The server saves the received trace as `source.bin`, creates `resolve.bin`,
+runs the program, and writes the snapshots to the output file. If no output
+file is given, it uses `session.tdbg`. Errors are printed in the terminal and
+the program exits with a non-zero status.
