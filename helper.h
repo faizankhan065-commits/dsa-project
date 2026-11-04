@@ -101,6 +101,72 @@ inline std::uint32_t readChecksumLittleEndian(
     return checksum;
 }
 
+class TrailerChecker
+{
+    std::uint8_t trailer[TTDB_CHECKSUM_TRAILER_SIZE];
+    std::size_t trailerStart;
+    std::size_t trailerSize;
+    Checksum32 checksum;
+
+public:
+    TrailerChecker() : trailerStart(0), trailerSize(0) {}
+
+    bool consume(const void *data, std::size_t length, void *safeBytes,
+                 std::size_t safeCapacity, std::size_t &safeSize)
+    {
+        safeSize = 0;
+        const std::size_t bytesToRelease =
+            length > TTDB_CHECKSUM_TRAILER_SIZE - trailerSize
+                ? length - (TTDB_CHECKSUM_TRAILER_SIZE - trailerSize)
+                : 0;
+        if (bytesToRelease > safeCapacity ||
+            (length > 0 && data == NULL) ||
+            (bytesToRelease > 0 && safeBytes == NULL))
+        {
+            return false;
+        }
+
+        const std::uint8_t *input = static_cast<const std::uint8_t *>(data);
+        std::uint8_t *output = static_cast<std::uint8_t *>(safeBytes);
+        for (std::size_t i = 0; i < length; ++i)
+        {
+            if (trailerSize < TTDB_CHECKSUM_TRAILER_SIZE)
+            {
+                trailer[(trailerStart + trailerSize) % TTDB_CHECKSUM_TRAILER_SIZE] = input[i];
+                ++trailerSize;
+            }
+            else
+            {
+                output[safeSize++] = trailer[trailerStart];
+                trailer[trailerStart] = input[i];
+                trailerStart = (trailerStart + 1) % TTDB_CHECKSUM_TRAILER_SIZE;
+            }
+        }
+
+        if (safeSize > 0)
+        {
+            checksum.update(output, safeSize);
+        }
+        return true;
+    }
+
+    bool verify() const
+    {
+        if (trailerSize != TTDB_CHECKSUM_TRAILER_SIZE)
+        {
+            return false;
+        }
+
+        std::uint8_t checksumBytes[TTDB_CHECKSUM_TRAILER_SIZE];
+        for (std::size_t i = 0; i < TTDB_CHECKSUM_TRAILER_SIZE; ++i)
+        {
+            checksumBytes[i] =
+                trailer[(trailerStart + i) % TTDB_CHECKSUM_TRAILER_SIZE];
+        }
+        return readChecksumLittleEndian(checksumBytes) == checksum.value();
+    }
+};
+
 struct FuncEntry
 {
     std::string funcName;
