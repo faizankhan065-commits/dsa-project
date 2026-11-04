@@ -27,6 +27,7 @@
 #include <iostream>
 #include <string>
 #include <cstdlib>
+#include <cerrno>
 #include <thread>
 #include <mutex>
 #include <unistd.h>
@@ -100,14 +101,39 @@ sig_atomic_t flag = 1;
 // ---- Basic socket helpers ----
 bool sendAll(int sock, const char *buf, size_t n) 
 {
-    // Reply format: [status: 1 byte][sending_material][checksum: 4 bytes].
-    // send() may send fewer bytes than asked for, so keep calling it until all n bytes are sent.
-    
+    size_t sent = 0;
+    while (sent < n)
+    {
+        ssize_t result = send(sock, buf + sent, n - sent, MSG_NOSIGNAL);
+        if (result < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            return false;
+        }
+        if (result == 0)
+        {
+            return false;
+        }
+        sent += static_cast<size_t>(result);
+    }
+    return true;
 }
 bool sendError(int sock, const string &message)
 {
-    // Reply format: [status: 1 byte][payload until close][checksum: 4 bytes].
-    // For an error: send one byte with value 1, then the message text. 
+    const uint8_t status = TTDB_STATUS_ERROR;
+    Checksum32 checksum;
+    checksum.update(&status, sizeof(status));
+    checksum.update(message.data(), message.size());
+
+    uint8_t trailer[TTDB_CHECKSUM_TRAILER_SIZE];
+    writeChecksumLittleEndian(checksum.value(), trailer);
+
+    return sendAll(sock, reinterpret_cast<const char *>(&status), sizeof(status)) &&
+           sendAll(sock, message.data(), message.size()) &&
+           sendAll(sock, reinterpret_cast<const char *>(trailer), sizeof(trailer));
 }
 int createListenSocket(int port)
 { 
