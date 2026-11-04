@@ -27,6 +27,9 @@ numbers or existing variables, updates the current frame's variables, and
 rejects invalid numbers, missing variables, division by zero, and results
 outside the `int32` range.
 
+Shared limits, snapshot structures, client metadata, protocol status values,
+and CRC-32 helpers are declared in `helper.h` for use across the project.
+
 ## Running instructions and saving history
 
 The `executeProgram` helper starts at the offset of `main` in `resolve.bin`.

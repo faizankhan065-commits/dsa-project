@@ -40,7 +40,6 @@ using namespace std;
 
 // ---- Constants ----
 const char *SERVER_PATH = "./server";      // the program we start when the server is down
-const int IO_BUFFER_SIZE = 64 * 1024;      // fixed buffer for moving bytes
 const int LISTEN_BACKLOG = 16;             // connections the OS holds until accept() takes them
 const int MAX_PENDING_CLIENTS = 8;         // clients allowed to wait in our queue. More than this get "server busy".
 const int STARTUP_MAX_ATTEMPTS = 50;       // after starting the server, how many times we try to connect
@@ -90,14 +89,6 @@ public:
     {
 
     }
-};
-
-struct ClientInfo
-{
-    int sock;           // the connected socket
-    string address;     // the client's IP as text, e.g. "127.0.0.1"
-    int port;           // the client's port
-    time_t arrivedAt;   // when accept() returned
 };
 
 // The queue is used by two threads, so every use of it must be inside queueMutex.
