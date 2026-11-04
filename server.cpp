@@ -1,0 +1,1351 @@
+// ======================= TIME-TRAVEL DEBUGGER - SERVER TEMPLATE =======================
+
+// Pipeline this file implements, top to bottom:
+//   0. Receive  -- stream the client's .trace bytes straight to source.bin on disk
+//   1. Pass 0X0   -- validity check (FUNC/FUNC_END matching)
+//   2. Pass 0X1   -- resolve(): copy EVERY source line into resolve.bin as [offset][size][string], then patch CALL targets.
+//   3. Pass 0X2   -- execute resolve.bin: tokenize ONE line at a time, update the call stack, take a snapshot -> Timeline
+//   4. Pass 0X3   -- serialize Timeline -> session.tdbg(header + snapshot records + dense index)
+
+
+#include <iostream>
+#include <string>
+#include <cstdint>
+#include <fstream>
+#include <cstring>
+#include <cstdio>
+#include <limits>
+#include <new>
+using namespace std;
+
+// ---- Constants ----
+const int32_t MAX_VARS_PER_FRAME = 16;
+const int32_t MAX_STACK_DEPTH = 64;
+const int32_t MAX_FUNCS = 128;
+const int32_t MAX_TOKENS = MAX_VARS_PER_FRAME + 2; // kW + func_name + upto 16 params/args
+const int32_t MAX_PATCHES = MAX_FUNCS * 4;
+const uint64_t MAX_SOURCE_BYTES = 15ULL * 1024 * 1024; // sanity cap on the declared file length
+const int32_t IO_BUFFER_SIZE = 64 * 1024;                  // fixed buffer for streaming to/from disk
+
+// ---- Custom data structures
+
+// Stack: back the live Call Stack during execution
+template <typename T>
+class Stack
+{
+    struct Node
+    {
+        T data;
+        Node *next;
+    };
+    Node *top;
+    int32_t count;
+
+public:
+    // Implement these functions:
+    Stack()
+    { // initialize the stack
+        top = NULL;
+        count = 0;
+    }
+    ~Stack()
+    {
+        while (top != NULL)
+        {
+            Node *temp = top;
+            top = top->next;
+            delete temp;
+        }
+    }
+    void push(const T &val)
+    {
+        // pushes the value on the stack if max limit is not reached yet.
+        if (count >= MAX_STACK_DEPTH)
+        {
+            return;
+        }
+        Node *newNode = new Node();
+        newNode->data = val;
+        newNode->next = top;
+        top = newNode;
+        count++;
+    }
+    T pop()
+    {
+        // pop the top value on the stack
+        if (isEmpty())
+        {
+            T empty;
+            return empty;
+        }
+        Node *temp = top;
+        T val = top->data;
+        top = top->next;
+        delete temp;
+        count--;
+        return val;
+    }
+    T &peek()
+    {
+        // returns the top value on the stack
+        if (isEmpty())
+        {
+            static T empty;
+            return empty;
+        }
+        return top->data;
+    }
+    bool isEmpty()
+    {
+        return top == NULL;
+    }
+    int32_t depth()
+    {
+        return count;
+    }
+    int32_t snapshot_into(T out[], int32_t maxLen)
+    {
+        // copies every frame, top to bottom in the array given as a parameter
+        // this is what buildSnapshot() call, returns count written
+        if (isEmpty() || maxLen <= 0)
+        {
+            return 0;
+        }
+        Node *current = top;
+        int32_t written = 0;
+        int32_t index = 0;
+
+        // First count how many we can write
+        Node *temp = top;
+        while (temp != NULL && index < maxLen)
+        {
+            written++;
+            temp = temp->next;
+            index++;
+        }
+
+        // Copy top to bottom
+        current = top;
+        index = 0;
+        while (current != NULL && index < maxLen)
+        {
+            out[index] = current->data;
+            current = current->next;
+            index++;
+        }
+
+        return written;
+    }
+};
+
+
+// Timeline : doubly linked list of Snapshots
+struct Snapshot; // fwd declaration;
+struct TimelineNode
+{
+    Snapshot *data;
+    TimelineNode *next;
+    TimelineNode *prev;
+};
+class Timeline
+{
+    TimelineNode *head, *tail;
+    int32_t stepCount;
+
+public:
+    // Implement these functions
+    Timeline()
+    {
+        head = NULL;
+        tail = NULL;
+        stepCount = 0;
+    }
+    ~Timeline();
+    bool record(Snapshot *s)
+    {
+        if (s == NULL || stepCount == numeric_limits<int32_t>::max())
+        {
+            return false;
+        }
+
+        TimelineNode *newNode = new TimelineNode();
+        newNode->data = s;
+        newNode->next = NULL;
+        newNode->prev = tail;
+
+        if (tail != NULL)
+        {
+            tail->next = newNode;
+        }
+        tail = newNode;
+
+        if (head == NULL)
+        {
+            head = newNode;
+        }
+        stepCount++;
+        return true;
+    }
+    TimelineNode *begin()
+    {
+        return head;
+    }
+    int32_t getStepCount()
+    {
+        return stepCount;
+    }
+};
+
+// Core structs
+struct Variable
+{
+    string name;
+    int32_t value;
+};
+struct Frame
+{
+    string func_name;
+    int32_t argc;
+    Variable argv[MAX_VARS_PER_FRAME];
+    string callerArgNames[MAX_VARS_PER_FRAME];
+    bool callerArgIsVariable[MAX_VARS_PER_FRAME];
+    int32_t returnLine;
+    Variable locals[MAX_VARS_PER_FRAME];
+    int32_t localCount;
+};
+struct Snapshot
+{
+    Frame callStack[MAX_STACK_DEPTH];
+    int32_t stackDepth;
+};
+Timeline::~Timeline()
+{
+    TimelineNode *current = head;
+    while (current != NULL)
+    {
+        TimelineNode *next = current->next;
+        delete current->data;
+        delete current;
+        current = next;
+    }
+}
+struct TTDBHeader
+{
+    char magic[4]; // "TTDB"
+    int32_t version;
+    int32_t stepCount;
+    int64_t indexOffset;
+};
+
+// resolve.bin - bookkeeping
+struct FuncEntry
+{
+    string funcName;
+    int64_t byteOffsetInResolveBin; // where this function's FUNC header record sits
+};
+struct PendingPatch
+{
+    int64_t byteOffsetOfOffsetField; // where in resolve.bin to seek back and overwrite
+    string targetFuncName;
+};
+
+
+
+// STAGE 0: RECEIVE TRACE AND SAVE IT AS source.bin
+bool receiveTrace(istream &client)
+{
+    ofstream source("source.bin", ios::binary | ios::trunc);
+    if (!source.is_open())
+    {
+        return false;
+    }
+
+    char buffer[IO_BUFFER_SIZE];
+    uint64_t totalBytes = 0;
+
+    while (client)
+    {
+        client.read(buffer, sizeof(buffer));
+        streamsize bytesRead = client.gcount();
+
+        if (bytesRead > 0)
+        {
+            uint64_t chunkSize = static_cast<uint64_t>(bytesRead);
+            if (totalBytes + chunkSize > MAX_SOURCE_BYTES)
+            {
+                source.close();
+                std::remove("source.bin");
+                return false;
+            }
+
+            source.write(buffer, bytesRead);
+            if (!source)
+            {
+                source.close();
+                std::remove("source.bin");
+                return false;
+            }
+
+            totalBytes += chunkSize;
+        }
+    }
+
+    if (client.bad() || (client.fail() && !client.eof()))
+    {
+        source.close();
+        std::remove("source.bin");
+        return false;
+    }
+
+    source.close();
+    if (!source)
+    {
+        std::remove("source.bin");
+        return false;
+    }
+
+    return true;
+}
+
+// PASS 0x0: READING source.bin + VALIDITY CHECK
+bool readSourceLine(ifstream &in, string &out)
+{
+    while (getline(in, out))
+    {
+        if (!out.empty() && out.back() == '\r')
+        {
+            out.pop_back();
+        }
+
+        bool hasText = false;
+        for (size_t i = 0; i < out.length(); i++)
+        {
+            if (out[i] != ' ' && out[i] != '\t')
+            {
+                hasText = true;
+                break;
+            }
+        }
+
+        if (!hasText)
+        {
+            continue;
+        }
+
+        while (!out.empty() && (out.back() == ' ' || out.back() == '\t'))
+        {
+            out.pop_back();
+        }
+        return true;
+    }
+
+    return false;
+}
+
+bool writeResolveRecord(ofstream &out, int64_t offset, const string &line)
+{
+    if (offset < 0 || line.length() > UINT32_MAX)
+    {
+        return false;
+    }
+
+    uint32_t lineSize = static_cast<uint32_t>(line.length());
+    out.write(reinterpret_cast<const char *>(&offset), sizeof(offset));
+    out.write(reinterpret_cast<const char *>(&lineSize), sizeof(lineSize));
+    out.write(line.data(), static_cast<streamsize>(lineSize));
+    return static_cast<bool>(out);
+}
+string firstWord(const string &line)
+{
+    // returns first word from the input string
+    string result = "";
+    bool inWord = false;
+
+    for (size_t i = 0; i < line.length(); i++)
+    {
+        char c = line[i];
+        if (c != ' ' && c != '\t' && c != '\r')
+        {
+            result += c;
+            inWord = true;
+        }
+        else if (inWord)
+        {
+            break;
+        }
+    }
+
+    return result;
+}
+string secondWord(const string &line)
+{
+    // returns the second word
+    string result = "";
+    int wordCount = 0;
+    bool inWord = false;
+
+    for (size_t i = 0; i < line.length(); i++)
+    {
+        char c = line[i];
+        if (c != ' ' && c != '\t' && c != '\r')
+        {
+            if (!inWord)
+            {
+                inWord = true;
+                wordCount++;
+            }
+            if (wordCount == 2)
+            {
+                result += c;
+            }
+        }
+        else
+        {
+            inWord = false;
+        }
+    }
+
+    return result;
+}
+
+int64_t findFunctionOffset(FuncEntry functions[], int32_t functionCount, const string &name)
+{
+    for (int32_t i = 0; i < functionCount; i++)
+    {
+        if (functions[i].funcName == name)
+        {
+            return functions[i].byteOffsetInResolveBin;
+        }
+    }
+
+    return -1;
+}
+
+bool patchCallTargets(ofstream &resolved, FuncEntry functions[], int32_t functionCount,
+                      PendingPatch patches[], int32_t patchCount)
+{
+    for (int32_t i = 0; i < patchCount; i++)
+    {
+        int64_t targetOffset = findFunctionOffset(functions, functionCount, patches[i].targetFuncName);
+        if (targetOffset < 0)
+        {
+            return false;
+        }
+
+        resolved.seekp(patches[i].byteOffsetOfOffsetField, ios::beg);
+        resolved.write(reinterpret_cast<const char *>(&targetOffset), sizeof(targetOffset));
+        if (!resolved)
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+// PASS 0x1: WRITE resolve.bin AND PATCH CALL TARGET OFFSETS
+int64_t resolve(const char *sourcePath, const char *resolvePath)
+{
+    if (sourcePath == NULL || resolvePath == NULL)
+    {
+        return -1;
+    }
+
+    ifstream source(sourcePath, ios::binary);
+    if (!source.is_open())
+    {
+        return -1;
+    }
+
+    ofstream resolved(resolvePath, ios::binary | ios::trunc);
+    if (!resolved.is_open())
+    {
+        return -1;
+    }
+
+    FuncEntry functions[MAX_FUNCS];
+    PendingPatch patches[MAX_PATCHES];
+    int32_t functionCount = 0;
+    int32_t patchCount = 0;
+    int64_t mainOffset = -1;
+    int64_t nextOffset = 0;
+    string line;
+
+    while (readSourceLine(source, line))
+    {
+        if (line.length() > UINT32_MAX || nextOffset < 0 ||
+            nextOffset > INT64_MAX - 12 - static_cast<int64_t>(line.length()))
+        {
+            resolved.close();
+            std::remove(resolvePath);
+            return -1;
+        }
+
+        int64_t recordOffset = nextOffset;
+        uint32_t lineSize = static_cast<uint32_t>(line.length());
+        string instruction = firstWord(line);
+        string name = secondWord(line);
+
+        if (instruction == "func")
+        {
+            if (name.empty() || functionCount >= MAX_FUNCS)
+            {
+                resolved.close();
+                std::remove(resolvePath);
+                return -1;
+            }
+
+            for (int32_t i = 0; i < functionCount; i++)
+            {
+                if (functions[i].funcName == name)
+                {
+                    resolved.close();
+                    std::remove(resolvePath);
+                    return -1;
+                }
+            }
+
+            functions[functionCount].funcName = name;
+            functions[functionCount].byteOffsetInResolveBin = recordOffset;
+            if (name == "main")
+            {
+                mainOffset = recordOffset;
+            }
+            functionCount++;
+        }
+        else if (instruction == "call")
+        {
+            if (name.empty() || patchCount >= MAX_PATCHES)
+            {
+                resolved.close();
+                std::remove(resolvePath);
+                return -1;
+            }
+
+            patches[patchCount].byteOffsetOfOffsetField = recordOffset;
+            patches[patchCount].targetFuncName = name;
+            patchCount++;
+        }
+
+        if (!writeResolveRecord(resolved, recordOffset, line))
+        {
+            resolved.close();
+            std::remove(resolvePath);
+            return -1;
+        }
+
+        nextOffset += 12 + static_cast<int64_t>(lineSize);
+    }
+
+    if (source.bad())
+    {
+        resolved.close();
+        std::remove(resolvePath);
+        return -1;
+    }
+
+    if (mainOffset < 0)
+    {
+        resolved.close();
+        std::remove(resolvePath);
+        return -1;
+    }
+
+    if (!patchCallTargets(resolved, functions, functionCount, patches, patchCount))
+    {
+        resolved.close();
+        std::remove(resolvePath);
+        return -1;
+    }
+
+    resolved.close();
+    if (!resolved)
+    {
+        std::remove(resolvePath);
+        return -1;
+    }
+
+    return mainOffset;
+}
+
+enum TokenType
+{
+    KEYWORD,
+    IDENTIFIER,
+    PARAM
+};
+
+struct Token
+{
+    TokenType type;
+    string text;
+};
+
+bool tokenizeLine(const string &line, Token tokens[], int32_t maxTokens, int32_t &tokenCount)
+{
+    tokenCount = 0;
+    if (maxTokens <= 0)
+    {
+        return false;
+    }
+
+    size_t position = 0;
+    while (position < line.length())
+    {
+        while (position < line.length() && (line[position] == ' ' || line[position] == '\t'))
+        {
+            position++;
+        }
+
+        if (position == line.length())
+        {
+            break;
+        }
+
+        if (tokenCount >= maxTokens)
+        {
+            tokenCount = 0;
+            return false;
+        }
+
+        string text = "";
+        while (position < line.length() && line[position] != ' ' && line[position] != '\t')
+        {
+            text += line[position];
+            position++;
+        }
+
+        tokens[tokenCount].text = text;
+        if (tokenCount == 0)
+        {
+            tokens[tokenCount].type = KEYWORD;
+        }
+        else if (tokenCount == 1)
+        {
+            tokens[tokenCount].type = IDENTIFIER;
+        }
+        else
+        {
+            tokens[tokenCount].type = PARAM;
+        }
+        tokenCount++;
+    }
+
+    return tokenCount > 0;
+}
+
+int32_t findFrameVariable(const Frame &frame, const string &name)
+{
+    for (int32_t i = 0; i < frame.localCount; i++)
+    {
+        if (frame.locals[i].name == name)
+        {
+            return i;
+        }
+    }
+
+    for (int32_t i = 0; i < frame.argc; i++)
+    {
+        if (frame.argv[i].name == name)
+        {
+            return -i - 2;
+        }
+    }
+
+    return -1;
+}
+
+bool readFrameValue(const Frame &frame, const string &text, int32_t &value)
+{
+    int32_t variableIndex = findFrameVariable(frame, text);
+    if (variableIndex >= 0)
+    {
+        value = frame.locals[variableIndex].value;
+        return true;
+    }
+    if (variableIndex <= -2)
+    {
+        value = frame.argv[-variableIndex - 2].value;
+        return true;
+    }
+
+    size_t position = 0;
+    bool negative = false;
+    if (!text.empty() && (text[0] == '-' || text[0] == '+'))
+    {
+        negative = text[0] == '-';
+        position++;
+    }
+    if (position == text.length())
+    {
+        return false;
+    }
+
+    uint64_t limit = negative
+        ? static_cast<uint64_t>(numeric_limits<int32_t>::max()) + 1
+        : static_cast<uint64_t>(numeric_limits<int32_t>::max());
+    uint64_t number = 0;
+    for (; position < text.length(); position++)
+    {
+        char digit = text[position];
+        if (digit < '0' || digit > '9')
+        {
+            return false;
+        }
+        uint64_t digitValue = static_cast<uint64_t>(digit - '0');
+        if (number > (limit - digitValue) / 10)
+        {
+            return false;
+        }
+        number = number * 10 + digitValue;
+    }
+
+    if (negative)
+    {
+        if (number == limit)
+        {
+            value = numeric_limits<int32_t>::min();
+        }
+        else
+        {
+            value = -static_cast<int32_t>(number);
+        }
+    }
+    else
+    {
+        value = static_cast<int32_t>(number);
+    }
+    return true;
+}
+
+bool writeFrameValue(Frame &frame, const string &name, int32_t value, bool createLocal)
+{
+    int32_t variableIndex = findFrameVariable(frame, name);
+    if (variableIndex >= 0)
+    {
+        frame.locals[variableIndex].value = value;
+        return true;
+    }
+    if (variableIndex <= -2)
+    {
+        frame.argv[-variableIndex - 2].value = value;
+        return true;
+    }
+    if (!createLocal || frame.localCount >= MAX_VARS_PER_FRAME)
+    {
+        return false;
+    }
+
+    frame.locals[frame.localCount].name = name;
+    frame.locals[frame.localCount].value = value;
+    frame.localCount++;
+    return true;
+}
+
+bool executeArithmetic(const Token tokens[], int32_t tokenCount, Frame &frame)
+{
+    if (tokenCount != 3 || tokens[0].type != KEYWORD ||
+        tokens[1].type != IDENTIFIER || tokens[2].type != PARAM ||
+        frame.argc < 0 || frame.argc > MAX_VARS_PER_FRAME ||
+        frame.localCount < 0 || frame.localCount > MAX_VARS_PER_FRAME)
+    {
+        return false;
+    }
+
+    const string &operation = tokens[0].text;
+    if (operation != "set" && operation != "add" && operation != "sub" &&
+        operation != "mul" && operation != "div")
+    {
+        return false;
+    }
+
+    int32_t rightValue = 0;
+    if (!readFrameValue(frame, tokens[2].text, rightValue))
+    {
+        return false;
+    }
+
+    if (operation == "set")
+    {
+        return writeFrameValue(frame, tokens[1].text, rightValue, true);
+    }
+
+    int32_t targetIndex = findFrameVariable(frame, tokens[1].text);
+    if (targetIndex == -1)
+    {
+        return false;
+    }
+    int32_t leftValue = targetIndex >= 0
+        ? frame.locals[targetIndex].value
+        : frame.argv[-targetIndex - 2].value;
+    int64_t result = leftValue;
+
+    if (operation == "add")
+    {
+        result += rightValue;
+    }
+    else if (operation == "sub")
+    {
+        result -= rightValue;
+    }
+    else if (operation == "mul")
+    {
+        result *= rightValue;
+    }
+    else
+    {
+        if (rightValue == 0 ||
+            (leftValue == numeric_limits<int32_t>::min() && rightValue == -1))
+        {
+            return false;
+        }
+        result = leftValue / rightValue;
+    }
+
+    if (result < numeric_limits<int32_t>::min() || result > numeric_limits<int32_t>::max())
+    {
+        return false;
+    }
+
+    return writeFrameValue(frame, tokens[1].text, static_cast<int32_t>(result), false);
+}
+
+bool readResolveRecord(ifstream &resolved, int64_t offset, int64_t &recordOffset,
+                       string &line, int64_t &nextOffset)
+{
+    if (offset < 0)
+    {
+        return false;
+    }
+
+    resolved.clear();
+    resolved.seekg(0, ios::end);
+    streampos fileEndPosition = resolved.tellg();
+    if (fileEndPosition == streampos(-1))
+    {
+        return false;
+    }
+    streamoff fileEnd = static_cast<streamoff>(fileEndPosition);
+    if (static_cast<streamoff>(offset) > fileEnd - 12)
+    {
+        return false;
+    }
+
+    resolved.seekg(offset, ios::beg);
+    if (!resolved)
+    {
+        return false;
+    }
+
+    uint32_t lineSize = 0;
+    resolved.read(reinterpret_cast<char *>(&recordOffset), sizeof(recordOffset));
+    resolved.read(reinterpret_cast<char *>(&lineSize), sizeof(lineSize));
+    if (!resolved || recordOffset < 0 ||
+        static_cast<streamoff>(lineSize) > fileEnd - static_cast<streamoff>(offset) - 12)
+    {
+        return false;
+    }
+
+    line.assign(lineSize, '\0');
+    if (lineSize > 0)
+    {
+        resolved.read(&line[0], static_cast<streamsize>(lineSize));
+        if (!resolved)
+        {
+            return false;
+        }
+    }
+
+    nextOffset = offset + 12 + static_cast<int64_t>(lineSize);
+    return true;
+}
+
+bool recordSnapshot(Stack<Frame> &callStack, Timeline &timeline)
+{
+    Snapshot *snapshot = new Snapshot();
+    snapshot->stackDepth = callStack.snapshot_into(snapshot->callStack, MAX_STACK_DEPTH);
+    if (snapshot->stackDepth != callStack.depth())
+    {
+        delete snapshot;
+        return false;
+    }
+    if (!timeline.record(snapshot))
+    {
+        delete snapshot;
+        return false;
+    }
+    return true;
+}
+
+bool executeProgram(const char *resolvePath, int64_t mainOffset, Timeline &timeline)
+{
+    if (resolvePath == NULL || mainOffset < 0)
+    {
+        return false;
+    }
+
+    ifstream resolved(resolvePath, ios::binary);
+    if (!resolved.is_open())
+    {
+        return false;
+    }
+
+    Stack<Frame> callStack;
+    Frame mainFrame = {};
+    mainFrame.func_name = "main";
+    mainFrame.returnLine = -1;
+    callStack.push(mainFrame);
+    if (callStack.depth() != 1)
+    {
+        return false;
+    }
+
+    int64_t programCounter = mainOffset;
+    bool finished = false;
+    while (!finished)
+    {
+        int64_t recordOffset = -1;
+        int64_t nextOffset = -1;
+        string line;
+        if (!readResolveRecord(resolved, programCounter, recordOffset, line, nextOffset))
+        {
+            return false;
+        }
+
+        Token tokens[MAX_TOKENS];
+        int32_t tokenCount = 0;
+        if (!tokenizeLine(line, tokens, MAX_TOKENS, tokenCount))
+        {
+            return false;
+        }
+
+        const string &instruction = tokens[0].text;
+        if (instruction != "call" && recordOffset != programCounter)
+        {
+            return false;
+        }
+
+        if (instruction == "func")
+        {
+            if (tokenCount < 2 || callStack.isEmpty())
+            {
+                return false;
+            }
+
+            Frame &frame = callStack.peek();
+            if (tokens[1].text != frame.func_name || tokenCount - 2 != frame.argc)
+            {
+                return false;
+            }
+            for (int32_t i = 0; i < frame.argc; i++)
+            {
+                if (tokens[i + 2].text != frame.argv[i].name)
+                {
+                    return false;
+                }
+            }
+            programCounter = nextOffset;
+        }
+        else if (instruction == "call")
+        {
+            if (tokenCount < 2 || callStack.isEmpty())
+            {
+                return false;
+            }
+
+            int64_t functionOffset = recordOffset;
+            int64_t ignoredNextOffset = -1;
+            int64_t functionRecordOffset = -1;
+            string functionLine;
+            if (!readResolveRecord(resolved, functionOffset, functionRecordOffset,
+                                   functionLine, ignoredNextOffset))
+            {
+                return false;
+            }
+            if (functionRecordOffset != functionOffset)
+            {
+                return false;
+            }
+
+            Token functionTokens[MAX_TOKENS];
+            int32_t functionTokenCount = 0;
+            if (!tokenizeLine(functionLine, functionTokens, MAX_TOKENS, functionTokenCount) ||
+                functionTokens[0].text != "func" || functionTokenCount < 2 ||
+                functionTokens[1].text != tokens[1].text ||
+                functionTokenCount - 2 != tokenCount - 2 ||
+                nextOffset > numeric_limits<int32_t>::max())
+            {
+                return false;
+            }
+
+            Frame newFrame = {};
+            newFrame.func_name = functionTokens[1].text;
+            newFrame.argc = functionTokenCount - 2;
+            newFrame.returnLine = static_cast<int32_t>(nextOffset);
+
+            Frame &caller = callStack.peek();
+            for (int32_t i = 0; i < newFrame.argc; i++)
+            {
+                newFrame.argv[i].name = functionTokens[i + 2].text;
+                newFrame.callerArgNames[i] = tokens[i + 2].text;
+                newFrame.callerArgIsVariable[i] =
+                    findFrameVariable(caller, tokens[i + 2].text) != -1;
+                for (int32_t j = 0; j < i; j++)
+                {
+                    if (newFrame.argv[j].name == newFrame.argv[i].name)
+                    {
+                        return false;
+                    }
+                }
+                if (!readFrameValue(caller, tokens[i + 2].text, newFrame.argv[i].value))
+                {
+                    return false;
+                }
+            }
+
+            int32_t previousDepth = callStack.depth();
+            callStack.push(newFrame);
+            if (callStack.depth() != previousDepth + 1)
+            {
+                return false;
+            }
+            programCounter = functionOffset;
+        }
+        else if (instruction == "func_end")
+        {
+            if (tokenCount != 1 || callStack.isEmpty())
+            {
+                return false;
+            }
+
+            Frame finishedFrame = callStack.pop();
+            if (callStack.isEmpty())
+            {
+                finished = true;
+            }
+            else
+            {
+                if (finishedFrame.returnLine < 0)
+                {
+                    return false;
+                }
+                Frame &caller = callStack.peek();
+                for (int32_t i = 0; i < finishedFrame.argc; i++)
+                {
+                    if (finishedFrame.callerArgIsVariable[i] &&
+                        !writeFrameValue(caller, finishedFrame.callerArgNames[i],
+                                         finishedFrame.argv[i].value, false))
+                    {
+                        return false;
+                    }
+                }
+                programCounter = finishedFrame.returnLine;
+            }
+        }
+        else
+        {
+            if (callStack.isEmpty() ||
+                !executeArithmetic(tokens, tokenCount, callStack.peek()))
+            {
+                return false;
+            }
+            programCounter = nextOffset;
+        }
+
+        if (!recordSnapshot(callStack, timeline))
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool writeUInt32(ofstream &out, uint32_t value)
+{
+    unsigned char bytes[4];
+    for (int32_t i = 0; i < 4; i++)
+    {
+        bytes[i] = static_cast<unsigned char>((value >> (i * 8)) & 0xFF);
+    }
+    out.write(reinterpret_cast<const char *>(bytes), sizeof(bytes));
+    return static_cast<bool>(out);
+}
+
+bool writeInt32(ofstream &out, int32_t value)
+{
+    return writeUInt32(out, static_cast<uint32_t>(value));
+}
+
+bool writeInt64(ofstream &out, int64_t value)
+{
+    uint64_t bits = static_cast<uint64_t>(value);
+    unsigned char bytes[8];
+    for (int32_t i = 0; i < 8; i++)
+    {
+        bytes[i] = static_cast<unsigned char>((bits >> (i * 8)) & 0xFF);
+    }
+    out.write(reinterpret_cast<const char *>(bytes), sizeof(bytes));
+    return static_cast<bool>(out);
+}
+
+bool writeSerializedString(ofstream &out, const string &value)
+{
+    if (value.length() > UINT32_MAX)
+    {
+        return false;
+    }
+    return writeUInt32(out, static_cast<uint32_t>(value.length())) &&
+           (value.empty() ||
+            (out.write(value.data(), static_cast<streamsize>(value.length())), static_cast<bool>(out)));
+}
+
+bool writeSnapshot(ofstream &out, const Snapshot &snapshot)
+{
+    if (snapshot.stackDepth < 0 || snapshot.stackDepth > MAX_STACK_DEPTH ||
+        !writeInt32(out, snapshot.stackDepth))
+    {
+        return false;
+    }
+
+    for (int32_t i = 0; i < snapshot.stackDepth; i++)
+    {
+        const Frame &frame = snapshot.callStack[i];
+        if (frame.argc < 0 || frame.argc > MAX_VARS_PER_FRAME ||
+            frame.localCount < 0 || frame.localCount > MAX_VARS_PER_FRAME ||
+            !writeSerializedString(out, frame.func_name) || !writeInt32(out, frame.argc))
+        {
+            return false;
+        }
+
+        for (int32_t j = 0; j < frame.argc; j++)
+        {
+            if (!writeSerializedString(out, frame.argv[j].name) ||
+                !writeInt32(out, frame.argv[j].value))
+            {
+                return false;
+            }
+        }
+
+        if (!writeInt32(out, frame.returnLine) || !writeInt32(out, frame.localCount))
+        {
+            return false;
+        }
+        for (int32_t j = 0; j < frame.localCount; j++)
+        {
+            if (!writeSerializedString(out, frame.locals[j].name) ||
+                !writeInt32(out, frame.locals[j].value))
+            {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+bool writeTdbg(Timeline &timeline, const char *tdbgPath)
+{
+    if (tdbgPath == NULL || timeline.getStepCount() < 0)
+    {
+        return false;
+    }
+
+    int32_t stepCount = timeline.getStepCount();
+    uint64_t *index = stepCount > 0 ? new (nothrow) uint64_t[stepCount] : NULL;
+    if (stepCount > 0 && index == NULL)
+    {
+        return false;
+    }
+
+    ofstream out(tdbgPath, ios::binary | ios::trunc);
+    if (!out.is_open())
+    {
+        delete[] index;
+        return false;
+    }
+
+    const auto failWrite = [&out, &index, tdbgPath]() -> bool
+    {
+        out.close();
+        std::remove(tdbgPath);
+        delete[] index;
+        return false;
+    };
+
+    const char magic[4] = {'T', 'T', 'D', 'B'};
+    out.write(magic, sizeof(magic));
+    if (!out || !writeInt32(out, 1) || !writeInt32(out, stepCount) || !writeInt64(out, 0))
+    {
+        return failWrite();
+    }
+
+    int32_t writtenSnapshots = 0;
+    for (TimelineNode *node = timeline.begin(); node != NULL; node = node->next)
+    {
+        if (writtenSnapshots >= stepCount)
+        {
+            return failWrite();
+        }
+
+        streampos position = out.tellp();
+        if (position == streampos(-1))
+        {
+            return failWrite();
+        }
+        streamoff offset = static_cast<streamoff>(position);
+        if (offset < 0)
+        {
+            return failWrite();
+        }
+
+        index[writtenSnapshots] = static_cast<uint64_t>(offset);
+        if (!writeSnapshot(out, *node->data))
+        {
+            return failWrite();
+        }
+        writtenSnapshots++;
+    }
+
+    if (writtenSnapshots != stepCount)
+    {
+        return failWrite();
+    }
+
+    streampos indexPosition = out.tellp();
+    if (indexPosition == streampos(-1) || static_cast<streamoff>(indexPosition) < 0)
+    {
+        return failWrite();
+    }
+    uint64_t indexOffset = static_cast<uint64_t>(static_cast<streamoff>(indexPosition));
+    for (int32_t i = 0; i < stepCount; i++)
+    {
+        if (!writeInt64(out, static_cast<int64_t>(index[i])))
+        {
+            return failWrite();
+        }
+    }
+
+    out.seekp(0, ios::beg);
+    if (!out || !out.write(magic, sizeof(magic)) ||
+        !writeInt32(out, 1) || !writeInt32(out, stepCount) ||
+        !writeInt64(out, static_cast<int64_t>(indexOffset)))
+    {
+        return failWrite();
+    }
+
+    out.close();
+    if (!out)
+    {
+        std::remove(tdbgPath);
+        delete[] index;
+        return false;
+    }
+
+    delete[] index;
+    return true;
+}
+
+bool validateProgram(const char *sourcePath)
+{
+    ifstream in(sourcePath);
+    if (!in.is_open())
+    {
+        return false;
+    }
+
+    string line;
+    bool inFunc = false;
+
+    while (getline(in, line))
+    {
+        while (!line.empty() && line.back() == '\r')
+        {
+            line.pop_back();
+        }
+
+        string instruction = firstWord(line);
+        if (instruction == "func")
+        {
+            if (inFunc)
+            {
+                return false;
+            }
+
+            if (secondWord(line).empty())
+            {
+                return false;
+            }
+
+            inFunc = true;
+        }
+        else if (instruction == "func_end")
+        {
+            if (!inFunc || !secondWord(line).empty())
+            {
+                return false;
+            }
+
+            inFunc = false;
+        }
+    }
+
+    return !in.bad() && !inFunc;
+}
+
+int main(int argc, char *argv[])
+{
+    if (argc > 3)
+    {
+        cerr << "Usage: " << argv[0] << " [trace-file|-] [output.tdbg]" << endl;
+        return 2;
+    }
+
+    ifstream traceFile;
+    istream *trace = &cin;
+    if (argc >= 2 && string(argv[1]) != "-")
+    {
+        traceFile.open(argv[1], ios::binary);
+        if (!traceFile.is_open())
+        {
+            cerr << "Could not open trace input." << endl;
+            return 1;
+        }
+        trace = &traceFile;
+    }
+
+    const char *outputPath = argc == 3 ? argv[2] : "session.tdbg";
+    if (!receiveTrace(*trace))
+    {
+        cerr << "Could not receive trace or trace exceeds 15 MB." << endl;
+        return 1;
+    }
+    if (!validateProgram("source.bin"))
+    {
+        cerr << "Trace validation failed." << endl;
+        return 1;
+    }
+
+    int64_t mainOffset = resolve("source.bin", "resolve.bin");
+    if (mainOffset < 0)
+    {
+        cerr << "Could not resolve the trace. Check main and function calls." << endl;
+        return 1;
+    }
+
+    Timeline timeline;
+    if (!executeProgram("resolve.bin", mainOffset, timeline))
+    {
+        cerr << "Trace execution failed." << endl;
+        return 1;
+    }
+    if (!writeTdbg(timeline, outputPath))
+    {
+        cerr << "Could not write the .tdbg output." << endl;
+        return 1;
+    }
+
+    cout << "Created " << outputPath << " with "
+         << timeline.getStepCount() << " snapshots." << endl;
+    return 0;
+}

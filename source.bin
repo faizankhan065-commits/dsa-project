@@ -1,0 +1,7 @@
+func increment value
+add value 1
+func_end
+func main
+set count 4
+call increment count
+func_end
