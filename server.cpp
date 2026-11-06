@@ -1,7 +1,7 @@
 // ======================= TIME-TRAVEL DEBUGGER - SERVER TEMPLATE =======================
 
 // Pipeline this file implements, top to bottom:
-//   0. Receive  -- stream the client's .trace bytes straight to source.bin on disk
+//   0. Receive  -- stream the client socket to source.bin until its write side closes
 //   1. Pass 0X0   -- validity check (FUNC/FUNC_END matching)
 //   2. Pass 0X1   -- resolve(): copy EVERY source line into resolve.bin as [offset][size][string], then patch CALL targets.
 //   3. Pass 0X2   -- execute resolve.bin: tokenize ONE line at a time, update the call stack, take a snapshot -> Timeline
@@ -16,6 +16,12 @@
 #include <cstdio>
 #include <limits>
 #include <new>
+#include <cerrno>
+#include <cstdlib>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
 #include "helper.h"
 using namespace std;
 
@@ -204,9 +210,8 @@ Timeline::~Timeline()
         current = next;
     }
 }
-// resolve.bin - bookkeeping
 // STAGE 0: RECEIVE TRACE AND SAVE IT AS source.bin
-bool receiveTrace(istream &client)
+bool receiveTrace(int clientSocket)
 {
     ofstream source("source.bin", ios::binary | ios::trunc);
     if (!source.is_open())
@@ -216,49 +221,177 @@ bool receiveTrace(istream &client)
 
     char buffer[IO_BUFFER_SIZE];
     uint64_t totalBytes = 0;
+    bool tooLarge = false;
 
-    while (client)
+    while (true)
     {
-        client.read(buffer, sizeof(buffer));
-        streamsize bytesRead = client.gcount();
-
-        if (bytesRead > 0)
+        ssize_t bytesRead = recv(clientSocket, buffer, sizeof(buffer), 0);
+        if (bytesRead == 0)
         {
-            uint64_t chunkSize = static_cast<uint64_t>(bytesRead);
-            if (totalBytes + chunkSize > MAX_SOURCE_BYTES)
-            {
-                source.close();
-                std::remove("source.bin");
-                return false;
-            }
-
-            source.write(buffer, bytesRead);
-            if (!source)
-            {
-                source.close();
-                std::remove("source.bin");
-                return false;
-            }
-
-            totalBytes += chunkSize;
+            break;
         }
-    }
+        if (bytesRead < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            source.close();
+            std::remove("source.bin");
+            return false;
+        }
 
-    if (client.bad() || (client.fail() && !client.eof()))
-    {
-        source.close();
-        std::remove("source.bin");
-        return false;
+        uint64_t chunkSize = static_cast<uint64_t>(bytesRead);
+        if (tooLarge)
+        {
+            continue;
+        }
+        if (chunkSize > MAX_SOURCE_BYTES - totalBytes)
+        {
+            tooLarge = true;
+            source.close();
+            std::remove("source.bin");
+            continue;
+        }
+
+        source.write(buffer, static_cast<streamsize>(bytesRead));
+        if (!source)
+        {
+            source.close();
+            std::remove("source.bin");
+            return false;
+        }
+        totalBytes += chunkSize;
     }
 
     source.close();
-    if (!source)
+    if (tooLarge || !source)
     {
         std::remove("source.bin");
         return false;
     }
 
     return true;
+}
+
+bool sendAll(int sock, const char *buffer, size_t length)
+{
+    size_t sent = 0;
+    while (sent < length)
+    {
+        ssize_t result = send(sock, buffer + sent, length - sent, MSG_NOSIGNAL);
+        if (result < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            return false;
+        }
+        if (result == 0)
+        {
+            return false;
+        }
+        sent += static_cast<size_t>(result);
+    }
+    return true;
+}
+
+bool sendErrorResponse(int sock, const string &message)
+{
+    const uint8_t status = TTDB_STATUS_ERROR;
+    Checksum32 checksum;
+    checksum.update(&status, sizeof(status));
+    checksum.update(message.data(), message.size());
+
+    uint8_t trailer[TTDB_CHECKSUM_TRAILER_SIZE];
+    writeChecksumLittleEndian(checksum.value(), trailer);
+    return sendAll(sock, reinterpret_cast<const char *>(&status), sizeof(status)) &&
+           sendAll(sock, message.data(), message.size()) &&
+           sendAll(sock, reinterpret_cast<const char *>(trailer), sizeof(trailer));
+}
+
+bool sendTdbgResponse(int sock, const char *tdbgPath)
+{
+    if (tdbgPath == NULL)
+    {
+        return false;
+    }
+
+    ifstream tdbg(tdbgPath, ios::binary);
+    if (!tdbg.is_open())
+    {
+        return sendErrorResponse(sock, "Could not open the .tdbg output.");
+    }
+
+    const uint8_t status = TTDB_STATUS_OK;
+    Checksum32 checksum;
+    checksum.update(&status, sizeof(status));
+    if (!sendAll(sock, reinterpret_cast<const char *>(&status), sizeof(status)))
+    {
+        return false;
+    }
+
+    char buffer[IO_BUFFER_SIZE];
+    while (tdbg)
+    {
+        tdbg.read(buffer, sizeof(buffer));
+        streamsize bytesRead = tdbg.gcount();
+        if (bytesRead > 0)
+        {
+            checksum.update(buffer, static_cast<size_t>(bytesRead));
+            if (!sendAll(sock, buffer, static_cast<size_t>(bytesRead)))
+            {
+                return false;
+            }
+        }
+    }
+    if (tdbg.bad() || (tdbg.fail() && !tdbg.eof()))
+    {
+        return false;
+    }
+
+    uint8_t trailer[TTDB_CHECKSUM_TRAILER_SIZE];
+    writeChecksumLittleEndian(checksum.value(), trailer);
+    return sendAll(sock, reinterpret_cast<const char *>(trailer), sizeof(trailer));
+}
+
+int createListenSocket(int port)
+{
+    int listenSocket = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (listenSocket < 0)
+    {
+        perror("socket");
+        return -1;
+    }
+
+    int reuseAddress = 1;
+    if (setsockopt(listenSocket, SOL_SOCKET, SO_REUSEADDR,
+                   &reuseAddress, sizeof(reuseAddress)) < 0)
+    {
+        perror("setsockopt");
+        close(listenSocket);
+        return -1;
+    }
+
+    sockaddr_in address = {};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_ANY);
+    address.sin_port = htons(static_cast<uint16_t>(port));
+    if (bind(listenSocket, reinterpret_cast<sockaddr *>(&address),
+             sizeof(address)) < 0)
+    {
+        perror("bind");
+        close(listenSocket);
+        return -1;
+    }
+    if (listen(listenSocket, 1) < 0)
+    {
+        perror("listen");
+        close(listenSocket);
+        return -1;
+    }
+    return listenSocket;
 }
 
 // PASS 0x0: READING source.bin + VALIDITY CHECK
@@ -1250,57 +1383,83 @@ bool validateProgram(const char *sourcePath)
 
 int main(int argc, char *argv[])
 {
-    if (argc > 3)
+    if (argc != 2)
     {
-        cerr << "Usage: " << argv[0] << " [trace-file|-] [output.tdbg]" << endl;
+        cerr << "Usage: " << argv[0] << " <port>" << endl;
         return 2;
     }
 
-    ifstream traceFile;
-    istream *trace = &cin;
-    if (argc >= 2 && string(argv[1]) != "-")
+    char *end = NULL;
+    errno = 0;
+    long port = strtol(argv[1], &end, 10);
+    if (errno != 0 || end == argv[1] || *end != '\0' ||
+        port < 1 || port > 65535)
     {
-        traceFile.open(argv[1], ios::binary);
-        if (!traceFile.is_open())
+        cerr << "Port must be an integer between 1 and 65535." << endl;
+        return 2;
+    }
+
+    int listenSocket = createListenSocket(static_cast<int>(port));
+    if (listenSocket < 0)
+    {
+        return 1;
+    }
+
+    int clientSocket;
+    do
+    {
+        clientSocket = accept(listenSocket, NULL, NULL);
+    } while (clientSocket < 0 && errno == EINTR);
+    close(listenSocket);
+    if (clientSocket < 0)
+    {
+        perror("accept");
+        return 1;
+    }
+
+    bool responseSent = false;
+    if (!receiveTrace(clientSocket))
+    {
+        responseSent = sendErrorResponse(
+            clientSocket, "Could not receive trace or trace exceeds 15 MB.");
+    }
+    else if (!validateProgram("source.bin"))
+    {
+        responseSent = sendErrorResponse(clientSocket, "Trace validation failed.");
+    }
+    else
+    {
+        int64_t mainOffset = resolve("source.bin", "resolve.bin");
+        if (mainOffset < 0)
         {
-            cerr << "Could not open trace input." << endl;
-            return 1;
+            responseSent = sendErrorResponse(
+                clientSocket,
+                "Could not resolve the trace. Check main and function calls.");
         }
-        trace = &traceFile;
+        else
+        {
+            Timeline timeline;
+            if (!executeProgram("resolve.bin", mainOffset, timeline))
+            {
+                responseSent = sendErrorResponse(clientSocket, "Trace execution failed.");
+            }
+            else if (!writeTdbg(timeline, "session.tdbg"))
+            {
+                responseSent =
+                    sendErrorResponse(clientSocket, "Could not write the .tdbg output.");
+            }
+            else
+            {
+                responseSent = sendTdbgResponse(clientSocket, "session.tdbg");
+                if (responseSent)
+                {
+                    cerr << "Created session.tdbg with "
+                         << timeline.getStepCount() << " snapshots." << endl;
+                }
+            }
+        }
     }
 
-    const char *outputPath = argc == 3 ? argv[2] : "session.tdbg";
-    if (!receiveTrace(*trace))
-    {
-        cerr << "Could not receive trace or trace exceeds 15 MB." << endl;
-        return 1;
-    }
-    if (!validateProgram("source.bin"))
-    {
-        cerr << "Trace validation failed." << endl;
-        return 1;
-    }
-
-    int64_t mainOffset = resolve("source.bin", "resolve.bin");
-    if (mainOffset < 0)
-    {
-        cerr << "Could not resolve the trace. Check main and function calls." << endl;
-        return 1;
-    }
-
-    Timeline timeline;
-    if (!executeProgram("resolve.bin", mainOffset, timeline))
-    {
-        cerr << "Trace execution failed." << endl;
-        return 1;
-    }
-    if (!writeTdbg(timeline, outputPath))
-    {
-        cerr << "Could not write the .tdbg output." << endl;
-        return 1;
-    }
-
-    cout << "Created " << outputPath << " with "
-         << timeline.getStepCount() << " snapshots." << endl;
-    return 0;
+    close(clientSocket);
+    return responseSent ? 0 : 1;
 }

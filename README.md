@@ -58,21 +58,22 @@ from memory. Each string is stored with its length, followed by its text;
 integer fields use a fixed little-endian format. Each frame stores its
 function name, arguments, return position, and local variables.
 
-## Build and run on Windows
+## Build and run the network server
 
-With a C++ compiler installed, build the server from PowerShell:
+The server uses POSIX TCP sockets. Build it in a Linux/POSIX-compatible environment:
 
-```powershell
-g++ -std=c++11 server.cpp -o server.exe
+```bash
+g++ -std=c++11 server.cpp -o server
 ```
 
-Give it a trace file and, optionally, an output file:
+Start the server with its listening port:
 
-```powershell
-.\server.exe .\trace.txt .\session.tdbg
+```bash
+./server 5001
 ```
 
-The server saves the received trace as `source.bin`, creates `resolve.bin`,
-runs the program, and writes the snapshots to the output file. If no output
-file is given, it uses `session.tdbg`. Errors are printed in the terminal and
-the program exits with a non-zero status.
+The server handles one client request, reads the trace until the client closes
+its write side, saves it as `source.bin`, and runs the validation, resolution,
+execution, and serialization pipeline. It replies with `[status][payload][CRC-32]`
+and then exits; status `0` carries the `.tdbg` file and status `1` carries an
+error message.
