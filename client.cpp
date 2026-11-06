@@ -18,6 +18,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cerrno>
+#include <fstream>
 #include <unistd.h>
 #include <signal.h>
 #include <vector>
@@ -75,11 +77,151 @@ bool uploadSource(int sock, const char *sourcePath)
 }
 bool receiveResponse(int sock, const char *outTdbgPath, string &outError)
 {
-    // Reply on the wire: [status][payload][CRC-32]. The CRC covers the status byte too.
-    // Feed every received byte (status included) to a TrailerChecker.
-    // Status 1: collect the payload into outError. Status 0: write the payload to the file.
-    // At the end call verify(). If it fails, delete the file, set outError to
-    // "checksum mismatch, response corrupted" and return false.
+    outError.clear();
+    if (outTdbgPath == NULL)
+    {
+        outError = "invalid output path";
+        return false;
+    }
+
+    ofstream outputFile;
+    bool outputCreated = false;
+    bool statusKnown = false;
+    uint8_t status = 0;
+    TrailerChecker checker;
+    char inputBuffer[IO_BUFFER_SIZE];
+    uint8_t safeBuffer[IO_BUFFER_SIZE];
+
+    const auto discardOutput = [&outputFile, &outputCreated, outTdbgPath]()
+    {
+        if (outputFile.is_open())
+        {
+            outputFile.close();
+        }
+        if (outputCreated)
+        {
+            std::remove(outTdbgPath);
+        }
+    };
+
+    const auto consumeSafeBytes = [&](size_t safeSize) -> bool
+    {
+        size_t payloadOffset = 0;
+        if (!statusKnown && safeSize > 0)
+        {
+            status = safeBuffer[0];
+            statusKnown = true;
+            payloadOffset = 1;
+
+            if (status == TTDB_STATUS_OK)
+            {
+                outputFile.open(outTdbgPath, ios::binary | ios::trunc);
+                if (!outputFile.is_open())
+                {
+                    outError = "could not open output file";
+                    return false;
+                }
+                outputCreated = true;
+            }
+            else if (status != TTDB_STATUS_ERROR)
+            {
+                outError = "invalid response status";
+                return false;
+            }
+        }
+
+        if (payloadOffset == safeSize)
+        {
+            return true;
+        }
+
+        const char *payload =
+            reinterpret_cast<const char *>(safeBuffer + payloadOffset);
+        size_t payloadSize = safeSize - payloadOffset;
+        if (status == TTDB_STATUS_OK)
+        {
+            outputFile.write(payload, static_cast<streamsize>(payloadSize));
+            if (!outputFile)
+            {
+                outError = "could not write output file";
+                return false;
+            }
+        }
+        else
+        {
+            outError.append(payload, payloadSize);
+        }
+        return true;
+    };
+
+    while (true)
+    {
+        ssize_t received = recv(sock, inputBuffer, sizeof(inputBuffer), 0);
+        if (received == 0)
+        {
+            break;
+        }
+        if (received < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            outError = "failed receiving response";
+            discardOutput();
+            return false;
+        }
+
+        size_t safeSize = 0;
+        if (!checker.consume(inputBuffer, static_cast<size_t>(received),
+                             safeBuffer, sizeof(safeBuffer), safeSize))
+        {
+            outError = "invalid response stream";
+            discardOutput();
+            return false;
+        }
+        if (!consumeSafeBytes(safeSize))
+        {
+            discardOutput();
+            return false;
+        }
+    }
+
+    if (!checker.verify())
+    {
+        discardOutput();
+        outError = "checksum mismatch, response corrupted";
+        return false;
+    }
+    if (!statusKnown)
+    {
+        outError = "response is missing a status byte";
+        return false;
+    }
+    if (status == TTDB_STATUS_ERROR)
+    {
+        if (outError.empty())
+        {
+            outError = "server returned an unspecified error";
+        }
+        return false;
+    }
+
+    outputFile.flush();
+    if (!outputFile)
+    {
+        discardOutput();
+        outError = "could not write output file";
+        return false;
+    }
+    outputFile.close();
+    if (outputFile.fail())
+    {
+        discardOutput();
+        outError = "could not close output file";
+        return false;
+    }
+    return true;
 }
 
 // =============================================================================================
