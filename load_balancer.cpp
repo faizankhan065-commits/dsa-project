@@ -35,6 +35,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 #include "helper.h"
 using namespace std;
 
@@ -137,15 +138,89 @@ bool sendError(int sock, const string &message)
 }
 int createListenSocket(int port)
 { 
-    // Create a TCP socket with SOCK_CLOEXEC(flag).
-    // set SO_REUSEADDR so we can restart the load balancer right away.
-    // bind() to the port on any address, then listen(LISTEN_BACKLOG).
-    // If bind or listen fails, print the error and exit, because without this socket we cannot work.
+    if (port < 1 || port > 65535)
+    {
+        cerr << "Invalid load-balancer port." << endl;
+        return -1;
+    }
+
+    int listenSocket = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (listenSocket < 0)
+    {
+        perror("socket");
+        return -1;
+    }
+
+    int reuseAddress = 1;
+    if (setsockopt(listenSocket, SOL_SOCKET, SO_REUSEADDR,
+                   &reuseAddress, sizeof(reuseAddress)) < 0)
+    {
+        perror("setsockopt");
+        close(listenSocket);
+        return -1;
+    }
+
+    sockaddr_in address = {};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_ANY);
+    address.sin_port = htons(static_cast<uint16_t>(port));
+    if (bind(listenSocket, reinterpret_cast<sockaddr *>(&address),
+             sizeof(address)) < 0)
+    {
+        perror("bind");
+        close(listenSocket);
+        return -1;
+    }
+    if (listen(listenSocket, LISTEN_BACKLOG) < 0)
+    {
+        perror("listen");
+        close(listenSocket);
+        return -1;
+    }
+    return listenSocket;
 }
 int connectToServer(const char *host, int port)
 {
-    // Create a TCP socket (SOCK_CLOEXEC) and connect it to host:port.
-    // Return the socket, or -1 if the connection fails 
+    if (host == NULL || host[0] == '\0' || port < 1 || port > 65535)
+    {
+        return -1;
+    }
+
+    const string service = to_string(port);
+    addrinfo hints = {};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+
+    addrinfo *addresses = NULL;
+    int lookupResult = getaddrinfo(host, service.c_str(), &hints, &addresses);
+    if (lookupResult != 0)
+    {
+        cerr << "Could not resolve backend host: " << gai_strerror(lookupResult) << endl;
+        return -1;
+    }
+
+    int connectedSocket = -1;
+    for (addrinfo *address = addresses; address != NULL; address = address->ai_next)
+    {
+        int candidate = socket(address->ai_family,
+                               address->ai_socktype | SOCK_CLOEXEC,
+                               address->ai_protocol);
+        if (candidate < 0)
+        {
+            continue;
+        }
+
+        if (connect(candidate, address->ai_addr, address->ai_addrlen) == 0)
+        {
+            connectedSocket = candidate;
+            break;
+        }
+        close(candidate);
+    }
+
+    freeaddrinfo(addresses);
+    return connectedSocket;
 }
 
 // =============================================================================================
