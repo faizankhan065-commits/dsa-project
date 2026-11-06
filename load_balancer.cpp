@@ -28,6 +28,7 @@
 #include <string>
 #include <cstdlib>
 #include <cerrno>
+#include <chrono>
 #include <thread>
 #include <mutex>
 #include <unistd.h>
@@ -230,17 +231,37 @@ int connectToServer(const char *host, int port)
 
 bool startServer(int port)
 {
-    // Build the command text: SERVER_PATH + " " + port as text + "&"
-    //   Example: "./server 5001 &"
-    // Call system() with it.
-    // Return true if system() returned 0, otherwise false.
+    if (port < 1 || port > 65535)
+    {
+        return false;
+    }
+
+    string command = string(SERVER_PATH) + " " + to_string(port) + " &";
+    return system(command.c_str()) == 0;
 }
 int connectToServerWithWakeup()
 {
-    // 1. Try connectToServer(). If it works, return that socket. The server is alive.
-    // 2. Otherwise call startServer(). If it fails, return -1.
-    // 3. Try connectToServer() up to STARTUP_MAX_ATTEMPTS times 
-    // 4. Return the first working socket, or -1 if the server never came up.
+    int serverSocket = connectToServer(serverHost.c_str(), serverPort);
+    if (serverSocket >= 0)
+    {
+        return serverSocket;
+    }
+    if (!startServer(serverPort))
+    {
+        return -1;
+    }
+
+    for (int attempt = 0; attempt < STARTUP_MAX_ATTEMPTS; ++attempt)
+    {
+        this_thread::sleep_for(
+            chrono::milliseconds(STARTUP_POLL_INTERVAL_MS));
+        serverSocket = connectToServer(serverHost.c_str(), serverPort);
+        if (serverSocket >= 0)
+        {
+            return serverSocket;
+        }
+    }
+    return -1;
 }
 
 
