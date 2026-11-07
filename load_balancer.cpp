@@ -47,6 +47,7 @@ using namespace std;
 const char *SERVER_PATH = "./server";      // the program we start when the server is down
 const int LISTEN_BACKLOG = 16;             // connections the OS holds until accept() takes them
 const int MAX_PENDING_CLIENTS = 8;         // clients allowed to wait in our queue. More than this get "server busy".
+const int MAX_CLIENT_WAIT_SECONDS = 30;
 const int STARTUP_MAX_ATTEMPTS = 50;       // after starting the server, how many times we try to connect
 const int STARTUP_POLL_INTERVAL_MS = 100;  // wait between those tries (50 x 100 ms = 5 seconds in total)
 int lbPort = 5000;
@@ -469,6 +470,12 @@ void acceptLoop(int listenSock)
         client.address = addressText;
         client.port = ntohs(peerAddress.sin_port);
         client.arrivedAt = std::time(NULL);
+        if (client.arrivedAt == static_cast<std::time_t>(-1))
+        {
+            cerr << "Could not record client arrival time." << endl;
+            close(clientSocket);
+            continue;
+        }
         if (!pendingClients.enqueue(client))
         {
             if (!sendError(clientSocket, "server busy, try again later"))
@@ -486,6 +493,17 @@ void dispatcherLoop()
         ClientInfo client;
         if (pendingClients.dequeue(client))
         {
+            std::time_t now = std::time(NULL);
+            if (now == static_cast<std::time_t>(-1) ||
+                std::difftime(now, client.arrivedAt) > MAX_CLIENT_WAIT_SECONDS)
+            {
+                if (now == static_cast<std::time_t>(-1))
+                {
+                    cerr << "Could not determine queued client age; closing client." << endl;
+                }
+                close(client.sock);
+                continue;
+            }
             relayOneClient(client);
         }
         else
