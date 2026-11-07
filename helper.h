@@ -8,6 +8,7 @@
 const std::int32_t MAX_VARS_PER_FRAME = 16;
 const std::int32_t MAX_STACK_DEPTH = 64;
 const std::int32_t IO_BUFFER_SIZE = 64 * 1024;
+const std::uint64_t MAX_SOURCE_BYTES = 15ULL * 1024 * 1024;
 const std::int32_t TTDB_VERSION = 1;
 const std::uint8_t TTDB_STATUS_OK = 0;
 const std::uint8_t TTDB_STATUS_ERROR = 1;
@@ -53,7 +54,7 @@ struct ClientInfo
     std::time_t arrivedAt;
 };
 
-// CRC-32/ISO-HDLC; callers feed the status byte before the payload.
+// CRC-32/ISO-HDLC; framed replies include the status byte before the payload.
 class Checksum32
 {
     std::uint32_t state;

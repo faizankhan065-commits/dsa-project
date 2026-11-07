@@ -76,4 +76,5 @@ The server handles one client request, reads the trace until the client closes
 its write side, saves it as `source.bin`, and runs the validation, resolution,
 execution, and serialization pipeline. It replies with `[status][payload][CRC-32]`
 and then exits; status `0` carries the `.tdbg` file and status `1` carries an
-error message.
+error message. The load balancer validates the uploaded trace plus its CRC-32
+trailer, then validates the complete response before forwarding it.

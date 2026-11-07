@@ -28,6 +28,7 @@
 #include <string>
 #include <cstdlib>
 #include <cerrno>
+#include <cstdio>
 #include <chrono>
 #include <thread>
 #include <mutex>
@@ -318,30 +319,18 @@ int connectToServerWithWakeup()
     return -1;
 }
 
-
-// =============================================================================================
-// PART 2: PASSING THE STRING AND THE REPLY (one client, called by the main thread only)
-// =============================================================================================
-
-
-void relayOneClient(ClientInfo &c)
+bool receiveCheckedStream(int sock, FILE *spool, uint64_t maxPayloadBytes,
+                          const char *limitError, const char *checksumError,
+                          string &outError)
 {
-    int serverSocket = connectToServerWithWakeup();
-    if (serverSocket < 0)
-    {
-        if (!sendError(c.sock, "backend server failed to start"))
-        {
-            cerr << "Could not report backend startup failure to client." << endl;
-        }
-        close(c.sock);
-        return;
-    }
+    TrailerChecker checker;
+    char inputBuffer[IO_BUFFER_SIZE];
+    uint8_t safeBuffer[IO_BUFFER_SIZE];
+    uint64_t totalBytes = 0;
 
-    char buffer[IO_BUFFER_SIZE];
-    bool relayOk = true;
     while (true)
     {
-        ssize_t received = recv(c.sock, buffer, sizeof(buffer), 0);
+        ssize_t received = recv(sock, inputBuffer, sizeof(inputBuffer), 0);
         if (received == 0)
         {
             break;
@@ -352,52 +341,184 @@ void relayOneClient(ClientInfo &c)
             {
                 continue;
             }
-            perror("recv from client");
-            relayOk = false;
-            break;
+            outError = "Could not receive message.";
+            return false;
         }
-        if (!sendAll(serverSocket, buffer, static_cast<size_t>(received)))
+
+        size_t safeSize = 0;
+        if (!checker.consume(inputBuffer, static_cast<size_t>(received),
+                             safeBuffer, sizeof(safeBuffer), safeSize))
         {
-            cerr << "Could not relay client data to backend." << endl;
-            relayOk = false;
-            break;
+            outError = "Invalid message stream.";
+            return false;
         }
-    }
 
-    if (relayOk && shutdown(serverSocket, SHUT_WR) < 0)
-    {
-        perror("shutdown backend write side");
-        relayOk = false;
-    }
-
-    if (relayOk)
-    {
-        while (true)
+        uint64_t chunkSize = static_cast<uint64_t>(safeSize);
+        if (limitError != NULL &&
+            (totalBytes > maxPayloadBytes ||
+             chunkSize > maxPayloadBytes - totalBytes))
         {
-            ssize_t received = recv(serverSocket, buffer, sizeof(buffer), 0);
-            if (received == 0)
+            outError = limitError;
+            return false;
+        }
+        if (safeSize > 0 &&
+            fwrite(safeBuffer, 1, safeSize, spool) != safeSize)
+        {
+            outError = "Could not spool message.";
+            return false;
+        }
+        totalBytes += chunkSize;
+    }
+
+    if (!checker.verify())
+    {
+        outError = checksumError;
+        return false;
+    }
+    if (fseek(spool, 0, SEEK_SET) != 0)
+    {
+        outError = "Could not rewind spooled message.";
+        return false;
+    }
+    return true;
+}
+
+bool sendSpoolToSocket(int sock, FILE *spool, Checksum32 *checksum)
+{
+    if (fseek(spool, 0, SEEK_SET) != 0)
+    {
+        return false;
+    }
+
+    char buffer[IO_BUFFER_SIZE];
+    while (true)
+    {
+        size_t bytesRead = fread(buffer, 1, sizeof(buffer), spool);
+        if (bytesRead > 0)
+        {
+            if (checksum != NULL)
             {
-                break;
+                checksum->update(buffer, bytesRead);
             }
-            if (received < 0)
+            if (!sendAll(sock, buffer, bytesRead))
             {
-                if (errno == EINTR)
-                {
-                    continue;
-                }
-                perror("recv from backend");
-                break;
+                return false;
             }
-            if (!sendAll(c.sock, buffer, static_cast<size_t>(received)))
+        }
+        if (bytesRead < sizeof(buffer))
+        {
+            if (ferror(spool))
             {
-                cerr << "Could not relay backend response to client." << endl;
+                return false;
+            }
+            if (feof(spool))
+            {
                 break;
             }
         }
     }
+    return true;
+}
 
-    close(serverSocket);
+
+// =============================================================================================
+// PART 2: PASSING THE STRING AND THE REPLY (one client, called by the main thread only)
+// =============================================================================================
+
+
+void relayOneClient(ClientInfo &c)
+{
+    FILE *uploadSpool = tmpfile();
+    FILE *responseSpool = tmpfile();
+    int serverSocket = -1;
+
+    const auto cleanup = [&]()
+    {
+        if (serverSocket >= 0)
+        {
+            close(serverSocket);
+            serverSocket = -1;
+        }
+        if (uploadSpool != NULL)
+        {
+            fclose(uploadSpool);
+            uploadSpool = NULL;
+        }
+        if (responseSpool != NULL)
+        {
+            fclose(responseSpool);
+            responseSpool = NULL;
+        }
+    };
+    const auto rejectClient = [&](const string &message)
+    {
+        cleanup();
+        if (!sendError(c.sock, message))
+        {
+            cerr << "Could not report relay failure to client." << endl;
+        }
+        close(c.sock);
+        c.sock = -1;
+    };
+
+    if (uploadSpool == NULL || responseSpool == NULL)
+    {
+        rejectClient("Could not buffer relay data.");
+        return;
+    }
+
+    string transferError;
+    if (!receiveCheckedStream(c.sock, uploadSpool, MAX_SOURCE_BYTES,
+                              "Trace exceeds 15 MB.",
+                              "Client upload checksum mismatch.", transferError))
+    {
+        rejectClient(transferError);
+        return;
+    }
+
+    serverSocket = connectToServerWithWakeup();
+    if (serverSocket < 0)
+    {
+        rejectClient("backend server failed to start");
+        return;
+    }
+    if (!sendSpoolToSocket(serverSocket, uploadSpool, NULL))
+    {
+        rejectClient("Could not relay client data to backend.");
+        return;
+    }
+    if (shutdown(serverSocket, SHUT_WR) < 0)
+    {
+        rejectClient("Could not finish client upload to backend.");
+        return;
+    }
+    if (!receiveCheckedStream(serverSocket, responseSpool, 0, NULL,
+                              "Backend response checksum mismatch.",
+                              transferError))
+    {
+        rejectClient(transferError);
+        return;
+    }
+
+    Checksum32 responseChecksum;
+    if (!sendSpoolToSocket(c.sock, responseSpool, &responseChecksum))
+    {
+        cerr << "Could not relay verified backend response to client." << endl;
+        cleanup();
+        close(c.sock);
+        c.sock = -1;
+        return;
+    }
+
+    uint8_t trailer[TTDB_CHECKSUM_TRAILER_SIZE];
+    writeChecksumLittleEndian(responseChecksum.value(), trailer);
+    if (!sendAll(c.sock, reinterpret_cast<const char *>(trailer), sizeof(trailer)))
+    {
+        cerr << "Could not send verified backend checksum to client." << endl;
+    }
+    cleanup();
     close(c.sock);
+    c.sock = -1;
 }
 
 
