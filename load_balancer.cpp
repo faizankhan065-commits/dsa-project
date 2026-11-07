@@ -31,6 +31,8 @@
 #include <chrono>
 #include <thread>
 #include <mutex>
+#include <poll.h>
+#include <ctime>
 #include <unistd.h>
 #include <signal.h>
 #include <sys/socket.h>
@@ -148,7 +150,7 @@ public:
 };
 
 Queue<ClientInfo> pendingClients(queueMutex, MAX_PENDING_CLIENTS);
-sig_atomic_t flag = 1;
+volatile sig_atomic_t flag = 1;
 
 
 // ---- Basic socket helpers ----
@@ -323,14 +325,78 @@ int connectToServerWithWakeup()
 
 void relayOneClient(ClientInfo &c)
 {
-    // 1. serverSock = connectToServerWithWakeup().
-    //    If it is -1: sendError "backend server failed to start", close clientSock, return.
-    // 3. Client -> server: repeat recv() from clientSock into a buffer of IO_BUFFER_SIZE and sendAll() it to serverSock.
-    //    Stop when recv() returns 0 (the client finished sending) or fails.
-    // 4. Call shutdown(serverSock, SHUT_WR), so the server knows the string is complete.
-    // 5. Server -> client: repeat recv() from serverSock and sendAll() to clientSock.
-    //    Stop when recv() returns 0 (the server sent its whole reply and closed) or fails.
-    // 6. Close both sockets.
+    int serverSocket = connectToServerWithWakeup();
+    if (serverSocket < 0)
+    {
+        if (!sendError(c.sock, "backend server failed to start"))
+        {
+            cerr << "Could not report backend startup failure to client." << endl;
+        }
+        close(c.sock);
+        return;
+    }
+
+    char buffer[IO_BUFFER_SIZE];
+    bool relayOk = true;
+    while (true)
+    {
+        ssize_t received = recv(c.sock, buffer, sizeof(buffer), 0);
+        if (received == 0)
+        {
+            break;
+        }
+        if (received < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            perror("recv from client");
+            relayOk = false;
+            break;
+        }
+        if (!sendAll(serverSocket, buffer, static_cast<size_t>(received)))
+        {
+            cerr << "Could not relay client data to backend." << endl;
+            relayOk = false;
+            break;
+        }
+    }
+
+    if (relayOk && shutdown(serverSocket, SHUT_WR) < 0)
+    {
+        perror("shutdown backend write side");
+        relayOk = false;
+    }
+
+    if (relayOk)
+    {
+        while (true)
+        {
+            ssize_t received = recv(serverSocket, buffer, sizeof(buffer), 0);
+            if (received == 0)
+            {
+                break;
+            }
+            if (received < 0)
+            {
+                if (errno == EINTR)
+                {
+                    continue;
+                }
+                perror("recv from backend");
+                break;
+            }
+            if (!sendAll(c.sock, buffer, static_cast<size_t>(received)))
+            {
+                cerr << "Could not relay backend response to client." << endl;
+                break;
+            }
+        }
+    }
+
+    close(serverSocket);
+    close(c.sock);
 }
 
 
@@ -341,16 +407,98 @@ void relayOneClient(ClientInfo &c)
 
 void acceptLoop(int listenSock)
 {
-    // Repeat: accept() a new client. 
-    // Enqueue the client; if the bounded queue is full, send "server busy, try again later".
-    // Never wait for the server here, so new clients are always accepted quickly.
-    // If accept() fails, print the error and keep going (do not end the thread).
+    while (flag)
+    {
+        pollfd listener = {};
+        listener.fd = listenSock;
+        listener.events = POLLIN;
+        int ready = poll(&listener, 1, 100);
+        if (ready == 0)
+        {
+            continue;
+        }
+        if (ready < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            if (flag)
+            {
+                perror("poll for client");
+            }
+            continue;
+        }
+        if ((listener.revents & POLLIN) == 0)
+        {
+            if (flag)
+            {
+                cerr << "Listening socket reported an unexpected event." << endl;
+            }
+            continue;
+        }
+
+        sockaddr_in peerAddress = {};
+        socklen_t peerAddressLength = sizeof(peerAddress);
+        int clientSocket = accept(
+            listenSock, reinterpret_cast<sockaddr *>(&peerAddress), &peerAddressLength);
+        if (clientSocket < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            if (flag)
+            {
+                perror("accept");
+            }
+            continue;
+        }
+
+        char addressText[INET_ADDRSTRLEN];
+        if (inet_ntop(AF_INET, &peerAddress.sin_addr,
+                      addressText, sizeof(addressText)) == NULL)
+        {
+            perror("inet_ntop");
+            close(clientSocket);
+            continue;
+        }
+
+        ClientInfo client;
+        client.sock = clientSocket;
+        client.address = addressText;
+        client.port = ntohs(peerAddress.sin_port);
+        client.arrivedAt = std::time(NULL);
+        if (!pendingClients.enqueue(client))
+        {
+            if (!sendError(clientSocket, "server busy, try again later"))
+            {
+                cerr << "Could not report a full client queue." << endl;
+            }
+            close(clientSocket);
+        }
+    }
 }
 void dispatcherLoop()
 {
-    // This runs in the main thread and never ends.
-    // Repeat: dequeue ONE client if one is waiting.
-    //   If we got a client: call relayOneClient(). The next client is taken out of the queue only after this one is finished.
+    while (flag)
+    {
+        ClientInfo client;
+        if (pendingClients.dequeue(client))
+        {
+            relayOneClient(client);
+        }
+        else
+        {
+            this_thread::sleep_for(chrono::milliseconds(10));
+        }
+    }
+
+    ClientInfo waitingClient;
+    while (pendingClients.dequeue(waitingClient))
+    {
+        close(waitingClient.sock);
+    }
 }
 
 void handler(int sg) {
@@ -359,10 +507,18 @@ void handler(int sg) {
 }
 int main(int argc, char *argv[])
 {
-
+    (void)argc;
+    (void)argv;
     signal(SIGINT, handler); // whenever ctrl+c will be pressed to exit the program the flag wll be set so insead of using infinite loop you can loop on flag to safely close things and exit
-    // 2. listenSock = createListenSocket(LB_PORT).
-    // 3. Start a thread that runs acceptLoop(listenSock) and detach it.
-    // 4. Call dispatcherLoop().
+    int listenSocket = createListenSocket(lbPort);
+    if (listenSocket < 0)
+    {
+        return 1;
+    }
+
+    thread acceptor(acceptLoop, listenSocket);
+    dispatcherLoop();
+    acceptor.join();
+    close(listenSocket);
     return 0;
 }
