@@ -52,8 +52,9 @@ string serverHost = "127.0.0.0";
 int serverPort = 5001;
 
 
-// ---- Queue: here it holds client sockets (int). ----
-// Implement it yourself, do not use std::queue.
+// The bounded linked-list queue synchronizes each operation on queueMutex.
+mutex queueMutex;
+
 template <typename T>
 class Queue
 {
@@ -61,42 +62,92 @@ class Queue
     {
         T data;
         Node *next;
+
+        explicit Node(const T &value) : data(value), next(NULL) {}
     };
     Node *front, *rear;
     int count;
-
+    const int capacity;
+    mutex &queueMutexRef;
 
 public:
-    // Implement these functions:
-    Queue()
+    Queue(mutex &guard, int maxSize)
+        : front(NULL), rear(NULL), count(0), capacity(maxSize), queueMutexRef(guard)
     {
-
     }
+
+    Queue(const Queue &) = delete;
+    Queue &operator=(const Queue &) = delete;
+
     ~Queue()
     {
-
+        lock_guard<mutex> lock(queueMutexRef);
+        while (front != NULL)
+        {
+            Node *node = front;
+            front = front->next;
+            delete node;
+        }
+        rear = NULL;
+        count = 0;
     }
-    void enqueue(const T &val)
-    {
 
-    }
-    T dequeue()
+    bool enqueue(const T &val)
     {
+        lock_guard<mutex> lock(queueMutexRef);
+        if (count >= capacity)
+        {
+            return false;
+        }
 
+        Node *node = new Node(val);
+        if (rear == NULL)
+        {
+            front = node;
+        }
+        else
+        {
+            rear->next = node;
+        }
+        rear = node;
+        ++count;
+        return true;
     }
-    bool isEmpty()
-    {
-        
-    }
-    int size()
-    {
 
+    bool dequeue(T &value)
+    {
+        lock_guard<mutex> lock(queueMutexRef);
+        if (front == NULL)
+        {
+            return false;
+        }
+
+        Node *node = front;
+        value = node->data;
+        front = node->next;
+        if (front == NULL)
+        {
+            rear = NULL;
+        }
+        delete node;
+        --count;
+        return true;
+    }
+
+    bool isEmpty() const
+    {
+        lock_guard<mutex> lock(queueMutexRef);
+        return front == NULL;
+    }
+
+    int size() const
+    {
+        lock_guard<mutex> lock(queueMutexRef);
+        return count;
     }
 };
 
-// The queue is used by two threads, so every use of it must be inside queueMutex.
-Queue<ClientInfo> pendingClients;
-mutex queueMutex;
+Queue<ClientInfo> pendingClients(queueMutex, MAX_PENDING_CLIENTS);
 sig_atomic_t flag = 1;
 
 
@@ -291,19 +342,14 @@ void relayOneClient(ClientInfo &c)
 void acceptLoop(int listenSock)
 {
     // Repeat: accept() a new client. 
-    //  If pendingClients.size() is already MAX_PENDING_CLIENTS: unlock, sendError "server busy, try again later",
-    // else
-    // Lock queueMutex.
-    //   close the client, and go on.
-    //   Otherwise enqueue the client socket.
+    // Enqueue the client; if the bounded queue is full, send "server busy, try again later".
     // Never wait for the server here, so new clients are always accepted quickly.
     // If accept() fails, print the error and keep going (do not end the thread).
 }
 void dispatcherLoop()
 {
     // This runs in the main thread and never ends.
-    // Repeat:
-    //   Lock queueMutex, take ONE client out of the queue if there is one, unlock.
+    // Repeat: dequeue ONE client if one is waiting.
     //   If we got a client: call relayOneClient(). The next client is taken out of the queue only after this one is finished.
 }
 
