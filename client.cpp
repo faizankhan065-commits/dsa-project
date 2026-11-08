@@ -20,10 +20,12 @@
 #include <cstring>
 #include <cerrno>
 #include <fstream>
+#include <stdlib.h>
 #include <unistd.h>
 #include <signal.h>
 #include <vector>
 #include <sys/socket.h>
+#include <netdb.h>
 #include "helper.h"
 using namespace std;
 
@@ -55,52 +57,161 @@ struct DebugSession
 
 bool recvAll(int sock, char *buf, size_t n)
 {
-    // recv() can return fewer bytes than asked for, so keep calling it until exactly n bytes are read.
-    // Return false if the connection closes or fails before n bytes arrive.
+    size_t received = 0;
+    while (received < n)
+    {
+        ssize_t result = recv(sock, buf + received, n - received, 0);
+        if (result < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            return false;
+        }
+        if (result == 0)
+        {
+            return false;
+        }
+        received += static_cast<size_t>(result);
+    }
+    return true;
 }
 bool sendAll(int sock, const char *buf, size_t n)
 {
-    // send() can send fewer bytes than asked for, so keep calling it until all n bytes are sent.
-    // Use the flag MSG_NOSIGNAL. Return false if the connection fails.
+    size_t sent = 0;
+    while (sent < n)
+    {
+        ssize_t result = send(sock, buf + sent, n - sent, MSG_NOSIGNAL);
+        if (result < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            return false;
+        }
+        if (result == 0)
+        {
+            return false;
+        }
+        sent += static_cast<size_t>(result);
+    }
+    return true;
 }
 
 int connectToHost(const char *host, int port)
 {
-    // Create a TCP socket and connect it to host:port.
-    // Return the socket, or -1 if the connection fails.
+    if (host == NULL || host[0] == '\0' || port < 1 || port > 65535)
+    {
+        return -1;
+    }
+
+    const string service = to_string(port);
+    addrinfo hints = {};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+
+    addrinfo *addresses = NULL;
+    int lookupResult = getaddrinfo(host, service.c_str(), &hints, &addresses);
+    if (lookupResult != 0)
+    {
+        cerr << "Could not resolve load-balancer host: "
+             << gai_strerror(lookupResult) << endl;
+        return -1;
+    }
+
+    int connectedSocket = -1;
+    for (addrinfo *address = addresses; address != NULL; address = address->ai_next)
+    {
+        int candidate = socket(address->ai_family,
+                               address->ai_socktype | SOCK_CLOEXEC,
+                               address->ai_protocol);
+        if (candidate < 0)
+        {
+            continue;
+        }
+        if (connect(candidate, address->ai_addr, address->ai_addrlen) == 0)
+        {
+            connectedSocket = candidate;
+            break;
+        }
+        close(candidate);
+    }
+
+    freeaddrinfo(addresses);
+    return connectedSocket;
 }
 bool uploadSource(int sock, const char *sourcePath)
 {
-    // have to do checksum and then send
-    // When the file is finished, call shutdown(sock, SHUT_WR). This is how the server knows the string is complete.
-    // Return false if the file cannot be opened or any send fails.
+    if (sourcePath == NULL)
+    {
+        return false;
+    }
+
+    ifstream source(sourcePath, ios::binary);
+    if (!source.is_open())
+    {
+        return false;
+    }
+
+    Checksum32 checksum;
+    char buffer[IO_BUFFER_SIZE];
+    while (source)
+    {
+        source.read(buffer, sizeof(buffer));
+        streamsize bytesRead = source.gcount();
+        if (bytesRead > 0)
+        {
+            checksum.update(buffer, static_cast<size_t>(bytesRead));
+            if (!sendAll(sock, buffer, static_cast<size_t>(bytesRead)))
+            {
+                return false;
+            }
+        }
+    }
+    if (source.bad() || (source.fail() && !source.eof()))
+    {
+        return false;
+    }
+
+    uint8_t trailer[TTDB_CHECKSUM_TRAILER_SIZE];
+    writeChecksumLittleEndian(checksum.value(), trailer);
+    if (!sendAll(sock, reinterpret_cast<const char *>(trailer), sizeof(trailer)))
+    {
+        return false;
+    }
+    return shutdown(sock, SHUT_WR) == 0;
 }
 bool receiveResponse(int sock, const char *outTdbgPath, string &outError)
 {
     outError.clear();
-    if (outTdbgPath == NULL)
+    if (outTdbgPath == NULL || outTdbgPath[0] == '\0')
     {
         outError = "invalid output path";
         return false;
     }
 
     ofstream outputFile;
-    bool outputCreated = false;
+    bool temporaryFileCreated = false;
+    string temporaryPath;
     bool statusKnown = false;
     uint8_t status = 0;
     TrailerChecker checker;
     char inputBuffer[IO_BUFFER_SIZE];
     uint8_t safeBuffer[IO_BUFFER_SIZE];
 
-    const auto discardOutput = [&outputFile, &outputCreated, outTdbgPath]()
+    const auto discardOutput = [&outputFile, &temporaryFileCreated, &temporaryPath]()
     {
         if (outputFile.is_open())
         {
             outputFile.close();
         }
-        if (outputCreated)
+        if (temporaryFileCreated)
         {
-            std::remove(outTdbgPath);
+            std::remove(temporaryPath.c_str());
+            temporaryFileCreated = false;
         }
     };
 
@@ -115,13 +226,29 @@ bool receiveResponse(int sock, const char *outTdbgPath, string &outError)
 
             if (status == TTDB_STATUS_OK)
             {
-                outputFile.open(outTdbgPath, ios::binary | ios::trunc);
+                string pattern = string(outTdbgPath) + ".part.XXXXXX";
+                vector<char> temporaryName(pattern.begin(), pattern.end());
+                temporaryName.push_back('\0');
+                int temporaryDescriptor = mkstemp(&temporaryName[0]);
+                if (temporaryDescriptor < 0)
+                {
+                    outError = "could not create temporary output file";
+                    return false;
+                }
+                temporaryPath.assign(&temporaryName[0]);
+                temporaryFileCreated = true;
+                if (close(temporaryDescriptor) != 0)
+                {
+                    outError = "could not close temporary output file";
+                    return false;
+                }
+
+                outputFile.open(temporaryPath.c_str(), ios::binary | ios::trunc);
                 if (!outputFile.is_open())
                 {
                     outError = "could not open output file";
                     return false;
                 }
-                outputCreated = true;
             }
             else if (status != TTDB_STATUS_ERROR)
             {
@@ -221,7 +348,36 @@ bool receiveResponse(int sock, const char *outTdbgPath, string &outError)
         outError = "could not close output file";
         return false;
     }
+    if (std::rename(temporaryPath.c_str(), outTdbgPath) != 0)
+    {
+        discardOutput();
+        outError = "could not replace output file";
+        return false;
+    }
+    temporaryFileCreated = false;
     return true;
+}
+
+bool requestDebugFile(const char *host, int port, const char *sourcePath,
+                      const char *outTdbgPath, string &outError)
+{
+    int sock = connectToHost(host, port);
+    if (sock < 0)
+    {
+        outError = "could not connect to load balancer";
+        return false;
+    }
+
+    if (!uploadSource(sock, sourcePath))
+    {
+        close(sock);
+        outError = "could not upload source";
+        return false;
+    }
+
+    bool received = receiveResponse(sock, outTdbgPath, outError);
+    close(sock);
+    return received;
 }
 
 // =============================================================================================
