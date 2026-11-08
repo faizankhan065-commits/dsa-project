@@ -80,3 +80,25 @@ error message. The load balancer validates the uploaded trace plus its CRC-32
 trailer, then validates the complete response before forwarding it. The client
 stages downloads separately and replaces the previous output only after the
 response checksum is valid.
+
+## Run the client
+
+Build the load balancer and client in the same POSIX-compatible environment:
+
+```bash
+g++ -std=c++11 -pthread load_balancer.cpp -o load_balancer
+g++ -std=c++11 client.cpp -o client
+```
+
+Start the load balancer in one terminal, then start the client in another:
+
+```bash
+./load_balancer
+./client 127.0.0.1 5000
+```
+
+The client supports `start <source-file>`, `next`, `prv`, `jmp next <n>`,
+`jmp prv <n>`, `help`, and `quit` (or `exit`). Quote a source path containing
+spaces. Navigation stays local to the validated `.tdbg` session; a failed
+download, invalid session file, or failed navigation does not replace or
+advance the current session.

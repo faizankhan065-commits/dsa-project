@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cerrno>
+#include <cctype>
 #include <fstream>
 #include <limits>
 #include <new>
@@ -785,6 +786,33 @@ bool showCurrent(DebugSession &s)
 }
 bool moveBy(DebugSession &s, int32_t delta)
 {
+    if (!s.active_flag || s.currentStep < 0 ||
+        s.currentStep >= s.reader.header.stepCount)
+    {
+        cerr << "no active debug session" << endl;
+        return false;
+    }
+
+    int64_t nextStep = s.currentStep + static_cast<int64_t>(delta);
+    if (nextStep < 0)
+    {
+        cerr << "already at the first step" << endl;
+        return false;
+    }
+    if (nextStep >= s.reader.header.stepCount)
+    {
+        cerr << "already at the last step" << endl;
+        return false;
+    }
+
+    int64_t previousStep = s.currentStep;
+    s.currentStep = nextStep;
+    if (!showCurrent(s))
+    {
+        s.currentStep = previousStep;
+        return false;
+    }
+    return true;
 }
 bool cmdStart(DebugSession &s, const string &sourcePath)
 {
@@ -825,10 +853,32 @@ bool cmdStart(DebugSession &s, const string &sourcePath)
     s.active_flag = 1;
     return showCurrent(s);
 }
-bool cmdNext(DebugSession &s) {}
-bool cmdPrv(DebugSession &s) {}
-bool cmdJmpNext(DebugSession &s, int32_t n) {}
-bool cmdJmpPrv(DebugSession &s, int32_t n) { }
+bool cmdNext(DebugSession &s)
+{
+    return moveBy(s, 1);
+}
+bool cmdPrv(DebugSession &s)
+{
+    return moveBy(s, -1);
+}
+bool cmdJmpNext(DebugSession &s, int32_t n)
+{
+    if (n <= 0 || n > MAX_JUMP)
+    {
+        cerr << "jump distance must be between 1 and " << MAX_JUMP << endl;
+        return false;
+    }
+    return moveBy(s, n);
+}
+bool cmdJmpPrv(DebugSession &s, int32_t n)
+{
+    if (n <= 0 || n > MAX_JUMP)
+    {
+        cerr << "jump distance must be between 1 and " << MAX_JUMP << endl;
+        return false;
+    }
+    return moveBy(s, -n);
+}
 
 // =============================================================================================
 // PART E: PRINTING
@@ -836,41 +886,284 @@ bool cmdJmpPrv(DebugSession &s, int32_t n) { }
 
 void printSnapshot(int32_t step, int32_t totalSteps, const Snapshot &s)
 {
+    cout << "Step " << step << " of " << totalSteps << endl;
+    if (s.stackDepth == 0)
+    {
+        cout << "Call stack: empty" << endl;
+        return;
+    }
+
+    cout << "Call stack:" << endl;
+    for (int32_t i = 0; i < s.stackDepth; ++i)
+    {
+        const Frame &frame = s.callStack[i];
+        cout << "  [" << i << "] " << frame.func_name << endl;
+        cout << "    Arguments:";
+        if (frame.argc == 0)
+        {
+            cout << " none";
+        }
+        for (int32_t j = 0; j < frame.argc; ++j)
+        {
+            cout << (j == 0 ? " " : ", ")
+                 << frame.argv[j].name << "=" << frame.argv[j].value;
+        }
+        cout << endl;
+
+        cout << "    Locals:";
+        if (frame.localCount == 0)
+        {
+            cout << " none";
+        }
+        for (int32_t j = 0; j < frame.localCount; ++j)
+        {
+            cout << (j == 0 ? " " : ", ")
+                 << frame.locals[j].name << "=" << frame.locals[j].value;
+        }
+        cout << endl;
+        if (frame.returnLine >= 0)
+        {
+            cout << "    Return line: " << frame.returnLine << endl;
+        }
+    }
 }
 void printHelp()
 {
-    // Print the commands
+    cout << "Commands:" << endl
+         << "  start <source-file>  Compile and start a debug session" << endl
+         << "  next                 Move to the next step" << endl
+         << "  prv                  Move to the previous step" << endl
+         << "  jmp next <n>          Move forward n steps" << endl
+         << "  jmp prv <n>           Move backward n steps" << endl
+         << "  help                 Show this help" << endl
+         << "  quit, exit           Close the debugger" << endl
+         << "A source path containing spaces may be quoted." << endl;
 }
 
 // =============================================================================================
 // PART F: THE INFINITE LOOP
 // =============================================================================================
 
+bool splitCommandLine(const string &line, vector<string> &words)
+{
+    words.clear();
+    string word;
+    char quote = '\0';
+    bool wordStarted = false;
+
+    for (size_t i = 0; i < line.size(); ++i)
+    {
+        char ch = line[i];
+        if (quote != '\0')
+        {
+            if (ch == '\\' && i + 1 < line.size() &&
+                (line[i + 1] == quote || line[i + 1] == '\\'))
+            {
+                word.push_back(line[++i]);
+            }
+            else if (ch == quote)
+            {
+                quote = '\0';
+            }
+            else
+            {
+                word.push_back(ch);
+            }
+            wordStarted = true;
+        }
+        else if (ch == '"' || ch == '\'')
+        {
+            quote = ch;
+            wordStarted = true;
+        }
+        else if (isspace(static_cast<unsigned char>(ch)))
+        {
+            if (wordStarted)
+            {
+                words.push_back(word);
+                word.clear();
+                wordStarted = false;
+            }
+        }
+        else
+        {
+            word.push_back(ch);
+            wordStarted = true;
+        }
+    }
+
+    if (quote != '\0')
+    {
+        return false;
+    }
+    if (wordStarted)
+    {
+        words.push_back(word);
+    }
+    return true;
+}
+
+bool parsePositiveJump(const string &text, int32_t &value)
+{
+    if (text.empty())
+    {
+        return false;
+    }
+    for (size_t i = 0; i < text.size(); ++i)
+    {
+        if (!isdigit(static_cast<unsigned char>(text[i])))
+        {
+            return false;
+        }
+    }
+
+    errno = 0;
+    char *end = NULL;
+    long parsed = strtol(text.c_str(), &end, 10);
+    if (errno == ERANGE || end == text.c_str() || *end != '\0' ||
+        parsed < 1 || parsed > MAX_JUMP)
+    {
+        return false;
+    }
+    value = static_cast<int32_t>(parsed);
+    return true;
+}
+
 bool runCommand(DebugSession &s, const string &line, bool &quitRequested)
 {
-    // 1. Split the line into words.
-    // 2. If the first word is "ttdb", drop it.
-    // 3. Match the first word:
-    //      start      -> needs a path after it, then cmdStart
-    //      next       -> no more words, then cmdNext
-    //      prv        -> no more words, then cmdPrv
-    //      jmp        -> second word "next" or "prv", third word a positive number ,
-    //                    then cmdJmpNext or cmdJmpPrv
-    //      help       -> printHelp
-    //      quit, exit -> set quitRequested = true
-    // 4. For anything else, or a wrong number of words, print "unknown command" and the help text, and return false.
+    vector<string> words;
+    if (!splitCommandLine(line, words))
+    {
+        cerr << "invalid command syntax" << endl;
+        printHelp();
+        return false;
+    }
+    if (words.empty())
+    {
+        return true;
+    }
+    if (words[0] == PROGRAM_NAME)
+    {
+        words.erase(words.begin());
+        if (words.empty())
+        {
+            cerr << "unknown command" << endl;
+            printHelp();
+            return false;
+        }
+    }
+
+    const string &command = words[0];
+    if (command == "start" && words.size() >= 2)
+    {
+        string sourcePath = words[1];
+        for (size_t i = 2; i < words.size(); ++i)
+        {
+            sourcePath += " " + words[i];
+        }
+        if (sourcePath.empty())
+        {
+            cerr << "unknown command" << endl;
+            printHelp();
+            return false;
+        }
+        return cmdStart(s, sourcePath);
+    }
+    if (command == "next" && words.size() == 1)
+    {
+        return cmdNext(s);
+    }
+    if (command == "prv" && words.size() == 1)
+    {
+        return cmdPrv(s);
+    }
+    if (command == "jmp")
+    {
+        if (words.size() != 3 ||
+            (words[1] != "next" && words[1] != "prv"))
+        {
+            cerr << "unknown command" << endl;
+            printHelp();
+            return false;
+        }
+
+        int32_t distance = 0;
+        if (!parsePositiveJump(words[2], distance))
+        {
+            cerr << "jump distance must be a positive integer no greater than "
+                 << MAX_JUMP << endl;
+            printHelp();
+            return false;
+        }
+        if (words[1] == "next")
+        {
+            return cmdJmpNext(s, distance);
+        }
+        return cmdJmpPrv(s, distance);
+    }
+    else if (command == "help" && words.size() == 1)
+    {
+        printHelp();
+        return true;
+    }
+    else if ((command == "quit" || command == "exit") && words.size() == 1)
+    {
+        quitRequested = true;
+        return true;
+    }
+
+    cerr << "unknown command" << endl;
+    printHelp();
+    return false;
 }
 int main(int argc, char *argv[])
 {
-    // you get string LB_HOST and int LB_PORT = 0 in arguments of this main function. 
+    if (argc > 3)
+    {
+        cerr << "usage: " << PROGRAM_NAME
+             << " [load-balancer-host [port]]" << endl;
+        return 2;
+    }
+    if (argc >= 2)
+    {
+        if (argv[1] == NULL || argv[1][0] == '\0')
+        {
+            cerr << "load-balancer host must not be empty" << endl;
+            return 2;
+        }
+        LB_HOST = argv[1];
+    }
+    if (argc == 3)
+    {
+        errno = 0;
+        char *end = NULL;
+        long parsedPort = strtol(argv[2], &end, 10);
+        if (errno == ERANGE || end == argv[2] || *end != '\0' ||
+            parsedPort < 1 || parsedPort > 65535)
+        {
+            cerr << "port must be an integer between 1 and 65535" << endl;
+            return 2;
+        }
+        LB_PORT = static_cast<int>(parsedPort);
+    }
 
-    // DebugSession session; initSession(session);
-    // Print a short welcome and the help text.
-    //
-    // Infinite loop:
-    //   if quitRequested, break
-    //
-    // After the loop: closeSession(session) and return 0.
-    // Never exit the loop because of an error. Only quit or the end of the input leaves it.
+    DebugSession session;
+    initSession(session);
+    cout << "Time-Travel Debugger" << endl;
+    printHelp();
 
+    bool quitRequested = false;
+    string line;
+    while (!quitRequested)
+    {
+        cout << PROMPT << flush;
+        if (!getline(cin, line))
+        {
+            break;
+        }
+        runCommand(session, line, quitRequested);
+    }
+
+    closeSession(session);
+    return 0;
 }
